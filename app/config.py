@@ -1,12 +1,22 @@
 # igw/app/config.py
+from __future__ import annotations
+
 from functools import lru_cache
 from pathlib import Path
+from typing import Optional
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    # Load env from igw/.env and ignore unknown keys
+    """
+    Central app settings. Loads env from igw/.env.
+    We keep canonical IG_* names (Instagram Basic Display)
+    and back-compat aliases (IGBD_* and lowercase helpers).
+    """
+
+    # Load .env from igw/.env and ignore unknown keys
     model_config = SettingsConfigDict(
         env_file=str(Path(__file__).resolve().parents[1] / ".env"),
         env_file_encoding="utf-8",
@@ -16,11 +26,11 @@ class Settings(BaseSettings):
     # Core / infra
     APP_ENV: str = "dev"
     DB_URL: str
-    REDIS_URL: str | None = None
+    REDIS_URL: Optional[str] = None
 
     # Optional convenience flags present in your .env
     DEBUG: bool = False
-    PYTHONPATH: str | None = None
+    PYTHONPATH: Optional[str] = None
 
     # Security
     JWT_SIGNING_KEY: str
@@ -30,19 +40,24 @@ class Settings(BaseSettings):
     DEFAULT_WALLET_CURRENCIES: str = "USD,VND"
     DEFAULT_WALLET_TYPE: str = "CASH"
 
-    # Instagram Basic Display (not Business Login)
+    # Instagram Basic Display (canonical)
     IG_CLIENT_ID: str = Field(..., env="IG_CLIENT_ID")
     IG_CLIENT_SECRET: str = Field(..., env="IG_CLIENT_SECRET")
     IG_REDIRECT_URI: str = Field(..., env="IG_REDIRECT_URI")
     IG_SCOPES: str = Field("user_profile", env="IG_SCOPES")
 
-    # -------- Back-compat LOWERCASE ALIASES --------
+    # (Optional) Facebook/Graph (unused by Basic Display but kept)
+    FB_APP_ID: Optional[str] = Field(None, env="FB_APP_ID")
+    FB_APP_SECRET: Optional[str] = Field(None, env="FB_APP_SECRET")
+    GRAPH_VERSION: str = Field("v20.0", env="GRAPH_VERSION")
+
+    # -------- Back-compat LOWERCASE helpers --------
     @property
-    def db_url(self) -> str:  # used by legacy code
+    def db_url(self) -> str:
         return self.DB_URL
 
     @property
-    def redis_url(self) -> str | None:
+    def redis_url(self) -> Optional[str]:
         return self.REDIS_URL
 
     @property
@@ -63,6 +78,23 @@ class Settings(BaseSettings):
 
     @property
     def ig_scopes(self) -> str:
+        return self.IG_SCOPES
+
+    # -------- Back-compat IGBD_* aliases (used by older code) --------
+    @property
+    def IGBD_APP_ID(self) -> str:
+        return self.IG_CLIENT_ID
+
+    @property
+    def IGBD_APP_SECRET(self) -> str:
+        return self.IG_CLIENT_SECRET
+
+    @property
+    def IGBD_REDIRECT_URI(self) -> str:
+        return self.IG_REDIRECT_URI
+
+    @property
+    def IGBD_SCOPES(self) -> str:
         return self.IG_SCOPES
 
 
