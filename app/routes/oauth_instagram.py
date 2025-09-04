@@ -1,138 +1,123 @@
-# igw/app/routes/oauth_instagram.py
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Request, HTTPException
 from fastapi.responses import RedirectResponse, JSONResponse
-import httpx
-from urllib.parse import urlencode
-import re
+from sqlalchemy.orm import Session as OrmSession
+import requests
+from ..config import settings
+from ..db import get_db
+from ..models import Player, Wallet, Session as DbSession
+from ..utils.security import create_token
 
-from igw.app.db import get_db
-from igw.app.models import Player, Wallet
-from igw.app.config import settings
+router = APIRouter(prefix="/oauth/instagram", tags=["oauth-instagram"])
 
-router = APIRouter(prefix="/oauth/instagram", tags=["instagram"])
-
-# Instagram OAuth endpoints
-OAUTH_AUTHORIZE_URL = "https://www.instagram.com/oauth/authorize"
-OAUTH_TOKEN_URL = "https://api.instagram.com/oauth/access_token"
-
-
-def ensure_two_wallets(db, player_id: int):
-    """Create USD and VND CASH wallets if they don't already exist."""
-    for currency in ("USD", "VND"):
-        exists = (
-            db.query(Wallet)
-            .filter(
-                Wallet.user_id == player_id,
-                Wallet.currency_code == currency,
-                Wallet.wallet_type == "CASH",
-            )
-            .first()
-        )
-        if not exists:
-            db.add(
-                Wallet(
-                    user_id=player_id,
-                    wallet_type="CASH",
-                    currency_code=currency,
-                    balance=0,
-                )
-            )
-
-
-def make_instagram_email(username: str | None, ig_id: str) -> str:
-    """
-    Build placeholder email in the form `<accountname>@instagram.com`.
-    If username is missing or invalid, fall back to ig_<id>@instagram.com.
-    """
-    if username:
-        local = re.sub(r"[^a-zA-Z0-9._+-]", "", username).lower()
-        if local:
-            return f"{local}@instagram.com"
-    return f"ig_{ig_id}@instagram.com"
-
+def _graph_url(path: str) -> str:
+    base = f"https://graph.facebook.com/{settings.graph_version}"
+    return f"{base}{path}"
 
 @router.get("/start")
 async def instagram_login():
+    # Use Facebook OAuth dialog for Instagram Business Login
+    dialog = f"https://www.facebook.com/{settings.graph_version}/dialog/oauth"
+    scope = ",".join([
+        "public_profile",
+        "email",
+        "pages_show_list",
+        "pages_read_engagement",
+        "instagram_basic",
+        "instagram_manage_comments",
+        "instagram_manage_messages",
+        "instagram_manage_insights",
+    ])
     params = {
-        "client_id": settings.ig_client_id,          # <— lower case field names
-        "redirect_uri": str(settings.ig_redirect_uri),
+        "client_id": settings.ig_client_id,
+        "redirect_uri": settings.ig_redirect_uri,
         "response_type": "code",
-        "scope": "instagram_business_basic",
+        "scope": scope,
     }
-    return RedirectResponse(f"{OAUTH_AUTHORIZE_URL}?{urlencode(params)}")
-
+    return RedirectResponse(f"{dialog}?"+ "&".join(f"{k}={requests.utils.quote(v)}" for k,v in params.items()))
 
 @router.get("/callback")
-async def instagram_callback(code: str, request: Request, db=Depends(get_db)):
-    # 1) Exchange code -> access_token
-    data = {
+async def instagram_callback(request: Request, code: str | None = None, error: str | None = None, db: OrmSession = Depends(get_db)):
+    if error:
+        raise HTTPException(status_code=400, detail=f"OAuth error: {error}")
+    if not code:
+        raise HTTPException(status_code=400, detail="Missing code")
+
+    # 1) Exchange code for a Facebook user access token
+    tok_res = requests.get(_graph_url("/oauth/access_token"), params={
         "client_id": settings.ig_client_id,
         "client_secret": settings.ig_client_secret,
-        "grant_type": "authorization_code",
-        "redirect_uri": str(settings.ig_redirect_uri),
+        "redirect_uri": settings.ig_redirect_uri,
         "code": code,
-    }
-    async with httpx.AsyncClient(timeout=20) as client:
-        token_resp = await client.post(OAUTH_TOKEN_URL, data=data)
+    }, timeout=15)
+    if tok_res.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"Token exchange failed: {tok_res.text}")
+    access_token = tok_res.json().get("access_token")
 
-    if token_resp.status_code != 200:
-        raise HTTPException(400, f"token exchange failed: {token_resp.text}")
+    # 2) Find an IG Business account linked to the user's Pages
+    pages = requests.get(_graph_url("/me/accounts"), params={"access_token": access_token, "fields": "instagram_business_account"}, timeout=15)
+    if pages.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"/me/accounts failed: {pages.text}")
 
-    tok = token_resp.json()
-    access_token = tok.get("access_token")
-    user_id = tok.get("user_id")
-    if not access_token or not user_id:
-        raise HTTPException(400, "invalid token response from Instagram")
+    data = pages.json().get("data", [])
+    ig_user_id = None
+    for p in data:
+        iba = p.get("instagram_business_account")
+        if iba and "id" in iba:
+            ig_user_id = iba["id"]
+            break
 
-    # 2) Fetch the IG user basic info (id, username)
-    async with httpx.AsyncClient(timeout=20) as client:
-        me_resp = await client.get(
-            "https://graph.instagram.com/me",
-            params={"fields": "id,username", "access_token": access_token},
-        )
+    if not ig_user_id:
+        # user has no linked IG business account
+        raise HTTPException(status_code=403, detail="No linked Instagram Business account on the Facebook profile you used.")
 
-    if me_resp.status_code != 200:
-        raise HTTPException(400, f"me fetch failed: {me_resp.text}")
+    # 3) Try to get IG username so we can build a non-null email
+    ig_profile = requests.get(_graph_url(f"/{ig_user_id}"), params={"access_token": access_token, "fields": "id,username"}, timeout=15)
+    username = None
+    if ig_profile.status_code == 200:
+        username = ig_profile.json().get("username")
 
-    me = me_resp.json()
-    ig_id = str(me.get("id"))
-    ig_username = me.get("username")
+    # Fallbacks for required DB fields
+    username = username or f"ig_{ig_user_id}"
+    email = f"{username}@instagram.com"  # << non-null, unique enough for our case
+    # Password is required by schema; mark as OAuth-only
+    password_hash = f"oauth:{ig_user_id}"
 
-    # 3) Upsert Player using ext_user_id (Instagram id)
-    player = db.query(Player).filter(Player.ext_user_id == ig_id).first()
-
+    # 4) Upsert player
+    player = db.query(Player).filter(Player.ext_user_id == str(ig_user_id)).first()
     if not player:
-        # Build placeholder email using the Instagram username
-        email = make_instagram_email(ig_username, ig_id)
-
-        # Satisfy NOT NULL constraints on email & password_hash
         player = Player(
-            ext_user_id=ig_id,
-            user_name=ig_username,     # keep if your table has this column
-            email=email,               # e.g. "accountname@instagram.com"
-            password_hash="",          # placeholder; you can force “complete profile” later
+            ext_user_id=str(ig_user_id),
+            user_name=username,
+            email=email,
+            password_hash=password_hash,
             language_code="en",
             status="active",
         )
         db.add(player)
-        db.flush()  # to get player.user_id
+        db.flush()  # to get player.userId
 
-        # Create USD & VND wallets
-        ensure_two_wallets(db, player.user_id)
-        db.commit()
+        # 5) Ensure two wallets (USD & VND)
+        usd = Wallet(userId=player.userId, wallet_type="main", currency_code="USD")
+        vnd = Wallet(userId=player.userId, wallet_type="main", currency_code="VND")
+        db.add_all([usd, vnd])
     else:
-        # Backfill email if empty/NULL
+        # backfill username/email if they were blank
+        if not player.user_name:
+            player.user_name = username
         if not player.email:
-            player.email = make_instagram_email(ig_username, ig_id)
-        ensure_two_wallets(db, player.user_id)
-        db.commit()
+            player.email = email
 
-    return JSONResponse(
-        {
-            "ok": True,
-            "player_id": player.user_id,
-            "ext_user_id": player.ext_user_id,
-            "user_name": getattr(player, "user_name", None),
-            "email": player.email,
-        }
-    )
+    # 6) Create session + JWT
+    jwt_token = create_token(sub=str(player.userId), extra={"ig_user_id": str(ig_user_id)})
+    login_ip = request.client.host if request.client else "unknown"
+    db.add(DbSession(userId=player.userId, token=jwt_token, Login_IP=login_ip))
+
+    db.commit()
+
+    return JSONResponse({
+        "ok": True,
+        "userId": player.userId,
+        "ext_user_id": player.ext_user_id,
+        "username": player.user_name,
+        "session_token": jwt_token,
+    })

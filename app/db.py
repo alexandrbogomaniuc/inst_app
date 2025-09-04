@@ -1,11 +1,14 @@
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from igw.app.config import settings
+from .config import settings
 
-# Use the UPPERCASE name defined in Settings
-engine = create_engine(settings.DB_URL, pool_pre_ping=True, future=True)
+engine = create_engine(
+    settings.db_url,
+    pool_pre_ping=True,
+    future=True,
+)
 
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 def get_db():
     db = SessionLocal()
