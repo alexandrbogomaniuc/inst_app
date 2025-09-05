@@ -1,67 +1,65 @@
 # igw/app/models.py
+from __future__ import annotations
+
+from datetime import datetime
+from decimal import Decimal
 
 from sqlalchemy import (
-    Column, Integer, String, DateTime, ForeignKey, JSON, func, Index
+    Column, Integer, String, Date, DateTime, ForeignKey, Numeric, Enum as SAEnum,
+    JSON, TIMESTAMP, text, CHAR
 )
-from sqlalchemy import Enum as SQLEnum   # <-- add this
 from sqlalchemy.orm import relationship
 
-from .db import Base
+from igw.app.db import Base
 
-# --- Player (matches your current DB) --------------------------------
+
 class Player(Base):
     __tablename__ = "players"
 
-    userId          = Column(Integer, primary_key=True, autoincrement=True)
-    user_name       = Column(String(100))
-    ext_user_id     = Column(String(100), index=True)         # ig user id
-    first_name      = Column(String(100))
-    last_name       = Column(String(100))
-    email           = Column(String(255), unique=True, nullable=False)
-    password_hash   = Column(String(255))
-    language_code   = Column(String(2), nullable=False, default="en")
-    registration_date = Column(DateTime, server_default=func.now())
-    status          = Column(String(20), default="active")
-    date_of_birth   = Column(DateTime)
-    phone_number    = Column(String(20))
-    country         = Column(String(100))
+    userId = Column(Integer, primary_key=True, autoincrement=True)
+    user_name = Column(String(255), nullable=True)
+    ext_user_id = Column(String(255), nullable=True, index=True, unique=False)
+    first_name = Column(String(100), nullable=True)
+    last_name = Column(String(100), nullable=True)
+    email = Column(String(255), nullable=False, unique=True)
+    password_hash = Column(String(255), nullable=True)
+    language_code = Column(CHAR(2), nullable=False, server_default="en")
+    registration_date = Column(DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+    status = Column(String(20), nullable=False, server_default="active")
+    date_of_birth = Column(Date, nullable=True)
+    phone_number = Column(String(20), nullable=True)
+    country = Column(String(100), nullable=True)
 
-    wallets   = relationship("Wallet", back_populates="player")
-    sessions  = relationship("UserSession", back_populates="player")
+    wallets = relationship("Wallet", back_populates="player", lazy="selectin")
+    sessions = relationship("UserSession", back_populates="player", lazy="selectin")
 
-# --- Wallet (matches your current DB) --------------------------------
+
 class Wallet(Base):
     __tablename__ = "wallets"
 
-    wallet_id     = Column(Integer, primary_key=True, autoincrement=True)
-    userId        = Column(Integer, ForeignKey("players.userId"), nullable=False)
-    wallet_type   = Column(String(10), nullable=False, default="CASH")
-    balance       = Column(String(32), default="0.00")   # or DECIMAL if you prefer
-    currency_code = Column(String(3), nullable=False, default="USD")
-    last_updated  = Column(DateTime, server_default=func.now())
+    wallet_id = Column(Integer, primary_key=True, autoincrement=True)
+    userId = Column(Integer, ForeignKey("players.userId"), nullable=False, index=True)
+    wallet_type = Column(String(10), nullable=False)
+    balance = Column(Numeric(15, 2), nullable=False, server_default="0")
+    currency_code = Column(CHAR(3), nullable=False, server_default="USD")
+    last_updated = Column(DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
 
     player = relationship("Player", back_populates="wallets")
 
-# --- Sessions (single source of truth for lobby+games) ----------------
+
 class UserSession(Base):
     __tablename__ = "sessions"
-    __table_args__ = (
-        Index("ix_sessions_user_status", "userId", "status", "session_type"),
-        Index("ix_sessions_expires_at", "expires_at"),
-    )
 
-    session_id   = Column(Integer, primary_key=True, autoincrement=True)
-    userId       = Column(Integer, ForeignKey("players.userId"), nullable=False)
-    token        = Column(String(512), unique=True, nullable=False)
-    session_type = Column(SQLEnum("lobby", "game", name="session_type_enum"),
-                          nullable=False, default="lobby")
-    provider     = Column(String(32))               # e.g., "BSG" for game sessions
-    meta         = Column(JSON)
-
-    login_time   = Column(DateTime, server_default=func.now(), nullable=False)
-    expires_at   = Column(DateTime)
-    logout_time  = Column(DateTime)
-    status       = Column(String(10), default="active")
-    Login_IP     = Column(String(45))
+    session_id = Column(Integer, primary_key=True, autoincrement=True)
+    userId = Column(Integer, ForeignKey("players.userId"), nullable=False, index=True)
+    token = Column(String(512), nullable=False, unique=True)
+    session_type = Column(SAEnum("lobby", "game", name="session_type"), nullable=False, server_default="lobby")
+    provider = Column(String(32), nullable=True)
+    meta = Column(JSON, nullable=True)
+    login_time = Column(TIMESTAMP, nullable=True, server_default=text("CURRENT_TIMESTAMP"))
+    expires_at = Column(TIMESTAMP, nullable=True)
+    logout_time = Column(TIMESTAMP, nullable=True)
+    status = Column(String(10), nullable=False, server_default="active")
+    Login_IP = Column(String(45), nullable=True)
 
     player = relationship("Player", back_populates="sessions")

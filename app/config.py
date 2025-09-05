@@ -1,22 +1,13 @@
 # igw/app/config.py
-from __future__ import annotations
-
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional
-
+from typing import Literal, Optional
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """
-    Central app settings. Loads env from igw/.env.
-    We keep canonical IG_* names (Instagram Basic Display)
-    and back-compat aliases (IGBD_* and lowercase helpers).
-    """
-
-    # Load .env from igw/.env and ignore unknown keys
+    # Load env from igw/.env and ignore unknown keys
     model_config = SettingsConfigDict(
         env_file=str(Path(__file__).resolve().parents[1] / ".env"),
         env_file_encoding="utf-8",
@@ -40,18 +31,22 @@ class Settings(BaseSettings):
     DEFAULT_WALLET_CURRENCIES: str = "USD,VND"
     DEFAULT_WALLET_TYPE: str = "CASH"
 
-    # Instagram Basic Display (canonical)
-    IG_CLIENT_ID: str = Field(..., env="IG_CLIENT_ID")
-    IG_CLIENT_SECRET: str = Field(..., env="IG_CLIENT_SECRET")
+    # Which login flow to use: "instagram_login" (direct IG) or "facebook_login" (Business via FB)
+    OAUTH_FLOW: Literal["instagram_login", "facebook_login"] = "instagram_login"
+
+    # ---- Instagram Login product (direct Instagram OAuth on instagram.com) ----
+    # Add the "Instagram Login" product in the Meta dashboard and use those credentials here.
+    IGBD_APP_ID: Optional[str] = None
+    IGBD_APP_SECRET: Optional[str] = None
     IG_REDIRECT_URI: str = Field(..., env="IG_REDIRECT_URI")
-    IG_SCOPES: str = Field("user_profile", env="IG_SCOPES")
+    IG_SCOPES: str = Field("user_profile", env="IG_SCOPES")  # IG Login accepts user_profile (optionally user_media)
 
-    # (Optional) Facebook/Graph (unused by Basic Display but kept)
-    FB_APP_ID: Optional[str] = Field(None, env="FB_APP_ID")
-    FB_APP_SECRET: Optional[str] = Field(None, env="FB_APP_SECRET")
-    GRAPH_VERSION: str = Field("v20.0", env="GRAPH_VERSION")
+    # ---- Facebook Login (Instagram API with Facebook Login; Business/Creator) ----
+    IG_CLIENT_ID: Optional[str] = None      # This is your Facebook App ID
+    IG_CLIENT_SECRET: Optional[str] = None  # Facebook App secret
+    GRAPH_VERSION: str = "v21.0"            # used for facebook.com dialog if you switch back
 
-    # -------- Back-compat LOWERCASE helpers --------
+    # -------- Back-compat LOWERCASE ALIASES (legacy code safety) --------
     @property
     def db_url(self) -> str:
         return self.DB_URL
@@ -65,11 +60,11 @@ class Settings(BaseSettings):
         return self.JWT_SIGNING_KEY
 
     @property
-    def ig_client_id(self) -> str:
+    def ig_client_id(self) -> Optional[str]:
         return self.IG_CLIENT_ID
 
     @property
-    def ig_client_secret(self) -> str:
+    def ig_client_secret(self) -> Optional[str]:
         return self.IG_CLIENT_SECRET
 
     @property
@@ -78,23 +73,6 @@ class Settings(BaseSettings):
 
     @property
     def ig_scopes(self) -> str:
-        return self.IG_SCOPES
-
-    # -------- Back-compat IGBD_* aliases (used by older code) --------
-    @property
-    def IGBD_APP_ID(self) -> str:
-        return self.IG_CLIENT_ID
-
-    @property
-    def IGBD_APP_SECRET(self) -> str:
-        return self.IG_CLIENT_SECRET
-
-    @property
-    def IGBD_REDIRECT_URI(self) -> str:
-        return self.IG_REDIRECT_URI
-
-    @property
-    def IGBD_SCOPES(self) -> str:
         return self.IG_SCOPES
 
 
