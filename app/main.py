@@ -5,9 +5,11 @@ from igw.app.routes.auth import router as auth_router
 from igw.app.routes.oauth_instagram import router as ig_oauth_router
 #rom igw.providers.bsg.routes import router as bsg_router (for BSG provider)
 
+from igw.app.providers.bsg.router import router as bsg_router
+
 
 app = FastAPI(title="IGW API", version="0.1.0")
-
+app.include_router(bsg_router)
 #app.include_router(bsg_router, prefix="/api/bsg", tags=["bsg"]) (for BSG provider)
 # CORS (tweak for your front-end)
 app.add_middleware(
@@ -17,7 +19,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(auth_router)
+app.include_router(ig_oauth_router)
+app.include_router(bsg_router)
 
+@app.get("/healthz")
+def health():
+    return {"ok": True}
 
 @app.get("/", tags=["root"])
 def root():
