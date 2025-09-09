@@ -1,360 +1,399 @@
 from __future__ import annotations
-import hashlib
-from datetime import datetime, timezone
-from decimal import Decimal
-from typing import Dict, Any
 
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import Response
+from hashlib import md5
+from typing import Any, Dict, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from sqlalchemy.orm import Session
-from jose import jwt, JWTError
 
-from ...db import get_db
-from ...models import Player, Wallet
-from ...config import settings
-from ...utils.account import ensure_wallets_for_user
-from .settings import bsg_settings, get_bank_settings, list_available_banks
+from igw.app.db import get_db
+from igw.app.models import UserSession
+from igw.app.utils.security import create_token, decode_token
+
+from .settings import (
+    bsg_settings,           # global/base settings (lru_cached callable)
+    get_bank_settings,      # load per-bank env as a pydantic model
+    resolve_bank_id,        # helper to resolve incoming bankId or fallback
+)
+
+# XML helpers (current API expects request_fields=dict for echoing <REQUEST/>)
+from .xml.utils import (
+    envelope_ok,
+    envelope_fail,
+    render_auth_response,
+    # You can add more specific renderers later (balance, bet, etc.)
+)
 
 router = APIRouter(prefix="/betsoft", tags=["betsoft"])
 
-def md5_hex(s: str) -> str:
-    return hashlib.md5(s.encode("utf-8")).hexdigest()
 
-def debug(msg: str) -> None:
-    print(f"[BSG] {msg}")
+# ------------------------------- Utilities -------------------------------
 
-def xml_response(request_tags: Dict[str, Any], response_tags: Dict[str, Any]) -> Response:
-    def tags_to_xml(d: Dict[str, Any]) -> str:
-        parts = []
-        for k, v in d.items():
-            if v is None:
-                continue
-            parts.append(f"<{k.upper()}>{str(v)}</{k.upper()}>")
-        return "".join(parts)
+def _media_response(payload: Any, protocol: str, *, status_code: int = 200) -> Response:
+    """
+    Return either XML (string) or JSON based on bank protocol.
+    """
+    if protocol == "json":
+        if isinstance(payload, str):
+            # payload shouldn't be string for json, wrap it
+            return JSONResponse({"payload": payload}, status_code=status_code)
+        return JSONResponse(payload, status_code=status_code)
+    # xml
+    if not isinstance(payload, str):
+        payload = str(payload)
+    return HTMLResponse(payload, status_code=status_code, media_type="application/xml")
 
-    now = datetime.now(timezone.utc).strftime("%d %b %Y %H:%M:%S")
-    body = (
-        "<EXTSYSTEM>"
-        f"<REQUEST>{tags_to_xml(request_tags)}</REQUEST>"
-        f"<TIME>{now}</TIME>"
-        f"<RESPONSE>{tags_to_xml(response_tags)}</RESPONSE>"
-        "</EXTSYSTEM>"
-    )
-    return Response(content=body, media_type="application/xml")
 
-def to_cents(dec: Decimal) -> int:
-    return int((dec * 100).quantize(Decimal("1")))
+def _hash_ok(token: str, pass_key: str, their_hash: str | None) -> bool:
+    if not their_hash:
+        return False
+    expected = md5((token + pass_key).encode("utf-8")).hexdigest()
+    return expected.lower() == their_hash.lower()
 
-def from_cents(cents: int) -> Decimal:
-    return (Decimal(cents) / Decimal(100)).quantize(Decimal("0.01"))
 
-def resolve_bank_id(bank_id_param: str | None) -> str:
-    if bank_id_param:
-        return bank_id_param
-    if bsg_settings.BSG_DEFAULT_BANK_ID:
-        return bsg_settings.BSG_DEFAULT_BANK_ID
-    banks = list_available_banks()
-    if not banks:
-        raise HTTPException(status_code=500, detail="No BSG bank configured")
-    return banks[0]
+def _echo_fields(token: Optional[str], hash_: Optional[str]) -> Dict[str, str]:
+    return {
+        "TOKEN": token or "",
+        "HASH": hash_ or "",
+    }
 
-def wallet_for_player(db: Session, user_id: int, currency_code: str | None) -> Wallet:
-    q = db.query(Wallet).filter(Wallet.userId == user_id)
-    if currency_code:
-        w = q.filter(Wallet.currency_code == currency_code).first()
-        if w:
-            return w
-    w = q.order_by(Wallet.wallet_id.asc()).first()
-    if not w:
-        ensure_wallets_for_user(db, user_id)
-        w = q.order_by(Wallet.wallet_id.asc()).first()
-    return w
 
-def verify_token_local(token: str) -> dict:
-    try:
-        return jwt.decode(token, settings.JWT_SIGNING_KEY, algorithms=["HS256"])
-    except JWTError as ex:
-        raise HTTPException(status_code=400, detail=f"Invalid token: {ex}")
-
+# ------------------------------- Endpoints -------------------------------
 
 @router.get("/authenticate")
 async def authenticate(
-    token: str,
-    hash: str,
-    bankId: str | None = None,
+    request: Request,
+    bankId: int | None = None,
+    token: str | None = None,
+    hash: str | None = None,
     clientType: str | None = None,
     db: Session = Depends(get_db),
 ):
-    bank_id = resolve_bank_id(bankId)
-    bank = get_bank_settings(bank_id)
-    hash_str = f"{token}{bank.BSG_PASS_KEY}"
-    debug(f"AUTH: bankId={bank_id} token={token!r} calc_md5({hash_str})")
-    if md5_hex(hash_str) != hash.lower():
-        return xml_response({"token": token, "hash": hash, "bankId": bank_id}, {"RESULT": "ERROR", "CODE": 500})
+    """
+    BSG calls this with a LOBBY token. We:
+      - verify MD5(token + PASS_KEY)
+      - decode the lobby token, extract uid
+      - mint a GAME token (shorter TTL)
+      - store a 'game' session
+      - reply using the bank's protocol (xml/json)
+    """
+    # Resolve bank + protocol
+    resolved_bank_id = resolve_bank_id(bankId)
+    bank = get_bank_settings(resolved_bank_id)
+    base = bsg_settings()
+    protocol = (bank.BSG_PROTOCOL or "xml").lower()
 
-    claims = verify_token_local(token)
-    user_id = int(claims.get("uid", 0))
-    if not user_id:
-        return xml_response({"token": token, "hash": hash, "bankId": bank_id}, {"RESULT": "ERROR", "CODE": 400})
+    req_fields = _echo_fields(token, hash)
 
-    player = db.query(Player).filter(Player.userId == user_id).first()
-    if not player:
-        return xml_response({"token": token, "hash": hash, "bankId": bank_id}, {"RESULT": "ERROR", "CODE": 399})
+    # Validate inputs
+    if not token or not hash:
+        payload = (
+            {"result": "failed", "code": 400, "reason": "missing token or hash", "request": req_fields}
+            if protocol == "json"
+            else envelope_fail(400, "missing token or hash", request_fields=req_fields)
+        )
+        return _media_response(payload, protocol, status_code=200)
 
-    currency = bank.BSG_DEFAULT_CURRENCY or bsg_settings.BSG_DEFAULT_CURRENCY
-    w = wallet_for_player(db, user_id, currency)
-    balance_cents = to_cents(w.balance)
+    # Verify hash
+    if not _hash_ok(token, bank.BSG_PASS_KEY, hash):
+        payload = (
+            {"result": "failed", "code": 401, "reason": "invalid hash", "request": req_fields}
+            if protocol == "json"
+            else envelope_fail(401, "invalid hash", request_fields=req_fields)
+        )
+        return _media_response(payload, protocol, status_code=200)
 
-    return xml_response(
-        {"token": token, "hash": hash, "bankId": bank_id},
-        {
-            "RESULT": "OK",
-            "USERID": player.userId,
-            "USERNAME": player.user_name or "",
-            "EMAIL": player.email or "",
-            "CURRENCY": w.currency_code,
-            "BALANCE": balance_cents,
-        },
+    # Decode lobby token
+    sub = decode_token(token)
+    if not sub or "uid" not in sub:
+        payload = (
+            {"result": "failed", "code": 401, "reason": "invalid token", "request": req_fields}
+            if protocol == "json"
+            else envelope_fail(401, "invalid token", request_fields=req_fields)
+        )
+        return _media_response(payload, protocol, status_code=200)
+
+    user_id = int(sub["uid"])
+
+    # Create GAME token
+    game_claims = {
+        "uid": user_id,
+        "type": "game",
+        "provider": "bsg",
+        "bankId": resolved_bank_id,
+        "gameId": bank.BSG_DEFAULT_GAME_ID,
+        "exp_m": base.BSG_TOKEN_GAME_EXP_MIN,
+    }
+    game_token = create_token(game_claims)
+
+    # Persist game session
+    sess = UserSession(
+        userId=user_id,
+        token=game_token,
+        session_type="game",
+        provider="bsg",
+        status="active",
+        Login_IP=(request.client.host if request and request.client else None),
+        meta={"bankId": resolved_bank_id, "gameId": bank.BSG_DEFAULT_GAME_ID},
     )
+    db.add(sess)
+    db.commit()
 
+    # Build reply
+    if protocol == "json":
+        payload = {
+            "result": "ok",
+            "userId": user_id,
+            "token": game_token,
+            "bankId": resolved_bank_id,
+            # echo back
+            "request": req_fields,
+        }
+        return _media_response(payload, protocol)
 
-@router.get("/balance")
-async def get_balance(
-    userId: str,
-    bankId: str | None = None,
-    db: Session = Depends(get_db),
-):
-    bank_id = resolve_bank_id(bankId)
-    player = db.query(Player).filter(Player.userId == int(userId)).first()
-    if not player:
-        return xml_response({"userId": userId, "bankId": bank_id}, {"RESULT": "ERROR", "CODE": 310})
-    bank = get_bank_settings(bank_id)
-    currency = bank.BSG_DEFAULT_CURRENCY or bsg_settings.BSG_DEFAULT_CURRENCY
-    w = wallet_for_player(db, player.userId, currency)
-    return xml_response({"userId": userId, "bankId": bank_id}, {"RESULT": "OK", "BALANCE": to_cents(w.balance)})
-
-
-@router.get("/account")
-async def get_account(
-    userId: str,
-    hash: str,
-    bankId: str | None = None,
-    db: Session = Depends(get_db),
-):
-    bank_id = resolve_bank_id(bankId)
-    bank = get_bank_settings(bank_id)
-    hash_str = f"{userId}{bank.BSG_PASS_KEY}"
-    debug(f"ACCOUNT: bankId={bank_id} userId={userId} calc_md5({hash_str})")
-    if md5_hex(hash_str) != hash.lower():
-        return xml_response({"userId": userId, "hash": hash, "bankId": bank_id}, {"RESULT": "ERROR", "CODE": 500})
-
-    player = db.query(Player).filter(Player.userId == int(userId)).first()
-    if not player:
-        return xml_response({"userId": userId, "hash": hash, "bankId": bank_id}, {"RESULT": "ERROR", "CODE": 310})
-
-    currency = bank.BSG_DEFAULT_CURRENCY or bsg_settings.BSG_DEFAULT_CURRENCY
-    w = wallet_for_player(db, player.userId, currency)
-
-    return xml_response(
-        {"userId": userId, "hash": hash, "bankId": bank_id},
-        {
-            "RESULT": "OK",
-            "USERNAME": player.user_name or "",
-            "FIRSTNAME": player.first_name or "",
-            "LASTNAME": player.last_name or "",
-            "EMAIL": player.email or "",
-            "CURRENCY": w.currency_code,
-        },
-    )
+    # XML
+    inner = render_auth_response(user_id, game_token, resolved_bank_id)
+    xml = envelope_ok(inner, request_fields=req_fields)
+    return _media_response(xml, protocol)
 
 
 @router.get("/betResult")
 async def bet_result(
-    userId: str,
-    bet: str | None = None,
-    win: str | None = None,
-    roundId: str | None = None,
-    gameId: str | None = None,
-    gameSessionId: str | None = None,
-    isRoundFinished: str | None = None,
-    negativeBet: str | None = None,
-    promoWinAmount: str | None = None,
-    jpWin: str | None = None,
-    jpContribution: str | None = None,
+    request: Request,
+    bankId: int | None = None,
     token: str | None = None,
-    clientType: str | None = None,
-    bankId: str | None = None,
-    hash: str = "",
+    hash: str | None = None,
     db: Session = Depends(get_db),
 ):
-    bank_id = resolve_bank_id(bankId)
-    bank = get_bank_settings(bank_id)
+    """
+    Minimal placeholder: verifies hash and token, returns OK.
+    Flesh this out with real wallet debits and result processing.
+    """
+    resolved_bank_id = resolve_bank_id(bankId)
+    bank = get_bank_settings(resolved_bank_id)
+    protocol = (bank.BSG_PROTOCOL or "xml").lower()
+    req_fields = _echo_fields(token, hash)
 
-    parts = [userId]
-    if bet is not None: parts.append(bet)
-    if win is not None: parts.append(win)
-    if isRoundFinished is not None: parts.append(isRoundFinished)
-    if roundId is not None: parts.append(roundId)
-    if gameId is not None: parts.append(gameId)
-    hash_str = "".join(parts) + bank.BSG_PASS_KEY
-    debug(f"BETRESULT: bankId={bank_id} userId={userId} bet={bet} win={win} roundId={roundId} gameId={gameId} isRoundFinished={isRoundFinished} calc_md5({hash_str})")
-    if md5_hex(hash_str) != hash.lower():
-        return xml_response({"USERID": userId, "HASH": hash, "bankId": bank_id}, {"RESULT": "ERROR", "CODE": 500})
-
-    player = db.query(Player).filter(Player.userId == int(userId)).first()
-    if not player:
-        return xml_response({"USERID": userId, "HASH": hash, "bankId": bank_id}, {"RESULT": "ERROR", "CODE": 310})
-
-    currency = bank.BSG_DEFAULT_CURRENCY or bsg_settings.BSG_DEFAULT_CURRENCY
-    w = wallet_for_player(db, player.userId, currency)
-    balance_cents = to_cents(w.balance)
-
-    if bet:
-        try:
-            bet_amount_str, casino_tx_id = bet.split("|", 1)
-            amt_cents = int(bet_amount_str)
-        except Exception:
-            return xml_response({"USERID": userId, "BET": bet, "bankId": bank_id}, {"RESULT": "ERROR", "CODE": 301})
-        if amt_cents > balance_cents:
-            return xml_response({"USERID": userId, "BET": bet, "bankId": bank_id}, {"RESULT": "ERROR", "CODE": 300})
-
-        balance_cents -= amt_cents
-        w.balance = from_cents(balance_cents)
-        db.commit()
-
-        ext_tx_id = f"{userId}_{roundId or 'r'}_{casino_tx_id}"
-        return xml_response(
-            {"USERID": userId, "BET": bet, "ROUNDID": roundId, "GAMEID": gameId, "GAMESESSIONID": gameSessionId, "ISROUNDFINISHED": isRoundFinished, "HASH": hash, "bankId": bank_id},
-            {"RESULT": "OK", "EXTSYSTEMTRANSACTIONID": ext_tx_id, "BALANCE": balance_cents},
+    if not token or not hash:
+        payload = (
+            {"result": "failed", "code": 400, "reason": "missing token or hash", "request": req_fields}
+            if protocol == "json" else envelope_fail(400, "missing token or hash", request_fields=req_fields)
         )
+        return _media_response(payload, protocol)
 
-    if win:
-        try:
-            win_amount_str, casino_tx_id = win.split("|", 1)
-            amt_cents = int(win_amount_str)
-        except Exception:
-            return xml_response({"USERID": userId, "WIN": win, "bankId": bank_id}, {"RESULT": "ERROR", "CODE": 301})
-
-        neg_cents = int(negativeBet) if negativeBet else 0
-        promo_cents = int(promoWinAmount) if promoWinAmount else 0
-        balance_cents += amt_cents + neg_cents + promo_cents
-        w.balance = from_cents(balance_cents)
-        db.commit()
-
-        ext_tx_id = f"{userId}_{roundId or 'r'}_{casino_tx_id}"
-        return xml_response(
-            {"USERID": userId, "WIN": win, "ROUNDID": roundId, "GAMEID": gameId, "GAMESESSIONID": gameSessionId, "ISROUNDFINISHED": isRoundFinished, "HASH": hash, "bankId": bank_id},
-            {"RESULT": "OK", "EXTSYSTEMTRANSACTIONID": ext_tx_id, "BALANCE": balance_cents},
+    if not _hash_ok(token, bank.BSG_PASS_KEY, hash):
+        payload = (
+            {"result": "failed", "code": 401, "reason": "invalid hash", "request": req_fields}
+            if protocol == "json" else envelope_fail(401, "invalid hash", request_fields=req_fields)
         )
+        return _media_response(payload, protocol)
 
-    return xml_response({"USERID": userId, "HASH": hash, "bankId": bank_id}, {"RESULT": "ERROR", "CODE": 301})
+    sub = decode_token(token)
+    if not sub or "uid" not in sub:
+        payload = (
+            {"result": "failed", "code": 401, "reason": "invalid token", "request": req_fields}
+            if protocol == "json" else envelope_fail(401, "invalid token", request_fields=req_fields)
+        )
+        return _media_response(payload, protocol)
+
+    # TODO: implement wager/balance updates and return the real shape
+    if protocol == "json":
+        return _media_response({"result": "ok", "bankId": resolved_bank_id, "request": req_fields}, protocol)
+    xml = envelope_ok("<response><result>ok</result></response>", request_fields=req_fields)
+    return _media_response(xml, protocol)
 
 
 @router.get("/refundBet")
 async def refund_bet(
-    userId: str,
-    casinoTransactionId: str,
-    hash: str,
-    bankId: str | None = None,
-    gameId: str | None = None,
-    amount: str | None = None,
-    roundId: str | None = None,
+    request: Request,
+    bankId: int | None = None,
     token: str | None = None,
+    hash: str | None = None,
     db: Session = Depends(get_db),
 ):
-    bank_id = resolve_bank_id(bankId)
-    bank = get_bank_settings(bank_id)
-    hash_str = f"{userId}{casinoTransactionId}{bank.BSG_PASS_KEY}"
-    debug(f"REFUND: bankId={bank_id} userId={userId} casinoTransactionId={casinoTransactionId} calc_md5({hash_str})")
-    if md5_hex(hash_str) != hash.lower():
-        return xml_response({"USERID": userId, "CASINOTRANSACTIONID": casinoTransactionId, "HASH": hash, "bankId": bank_id}, {"RESULT": "ERROR", "CODE": 500})
+    resolved_bank_id = resolve_bank_id(bankId)
+    bank = get_bank_settings(resolved_bank_id)
+    protocol = (bank.BSG_PROTOCOL or "xml").lower()
+    req_fields = _echo_fields(token, hash)
 
-    player = db.query(Player).filter(Player.userId == int(userId)).first()
-    if not player:
-        return xml_response({"USERID": userId, "CASINOTRANSACTIONID": casinoTransactionId, "bankId": bank_id}, {"RESULT": "ERROR", "CODE": 310})
+    if not token or not hash:
+        payload = (
+            {"result": "failed", "code": 400, "reason": "missing token or hash", "request": req_fields}
+            if protocol == "json" else envelope_fail(400, "missing token or hash", request_fields=req_fields)
+        )
+        return _media_response(payload, protocol)
 
-    if amount:
-        currency = bank.BSG_DEFAULT_CURRENCY or bsg_settings.BSG_DEFAULT_CURRENCY
-        w = wallet_for_player(db, player.userId, currency)
-        balance_cents = to_cents(w.balance) + int(amount)
-        w.balance = from_cents(balance_cents)
-        db.commit()
+    if not _hash_ok(token, bank.BSG_PASS_KEY, hash):
+        payload = (
+            {"result": "failed", "code": 401, "reason": "invalid hash", "request": req_fields}
+            if protocol == "json" else envelope_fail(401, "invalid hash", request_fields=req_fields)
+        )
+        return _media_response(payload, protocol)
 
-    ext_tx_id = f"{userId}_{roundId or 'r'}_{casinoTransactionId}"
-    return xml_response(
-        {"USERID": userId, "CASINOTRANSACTIONID": casinoTransactionId, "HASH": hash, "bankId": bank_id},
-        {"RESULT": "OK", "EXTSYSTEMTRANSACTIONID": ext_tx_id},
-    )
+    sub = decode_token(token)
+    if not sub or "uid" not in sub:
+        payload = (
+            {"result": "failed", "code": 401, "reason": "invalid token", "request": req_fields}
+            if protocol == "json" else envelope_fail(401, "invalid token", request_fields=req_fields)
+        )
+        return _media_response(payload, protocol)
+
+    if protocol == "json":
+        return _media_response({"result": "ok", "bankId": resolved_bank_id, "request": req_fields}, protocol)
+    xml = envelope_ok("<response><result>ok</result></response>", request_fields=req_fields)
+    return _media_response(xml, protocol)
 
 
-@router.get("/bonusRelease")
-async def bonus_release(
-    userId: str,
-    bonusId: str,
-    amount: str,
-    hash: str,
-    bankId: str | None = None,
+@router.get("/balance")
+async def balance(
+    request: Request,
+    bankId: int | None = None,
     token: str | None = None,
+    hash: str | None = None,
     db: Session = Depends(get_db),
 ):
-    bank_id = resolve_bank_id(bankId)
-    bank = get_bank_settings(bank_id)
-    hash_str = f"{userId}{bonusId}{amount}{bank.BSG_PASS_KEY}"
-    debug(f"BONUS_RELEASE: bankId={bank_id} uid={userId} bonusId={bonusId} amount={amount} calc_md5({hash_str})")
-    if md5_hex(hash_str) != hash.lower():
-        return xml_response({"USERID": userId, "BONUSID": bonusId, "AMOUNT": amount, "HASH": hash, "bankId": bank_id}, {"RESULT": "ERROR", "CODE": 500})
+    resolved_bank_id = resolve_bank_id(bankId)
+    bank = get_bank_settings(resolved_bank_id)
+    protocol = (bank.BSG_PROTOCOL or "xml").lower()
+    req_fields = _echo_fields(token, hash)
 
-    player = db.query(Player).filter(Player.userId == int(userId)).first()
-    if not player:
-        return xml_response({"USERID": userId, "bankId": bank_id}, {"RESULT": "ERROR", "CODE": 310})
+    if not token or not hash:
+        payload = (
+            {"result": "failed", "code": 400, "reason": "missing token or hash", "request": req_fields}
+            if protocol == "json" else envelope_fail(400, "missing token or hash", request_fields=req_fields)
+        )
+        return _media_response(payload, protocol)
 
-    currency = bank.BSG_DEFAULT_CURRENCY or bsg_settings.BSG_DEFAULT_CURRENCY
-    w = wallet_for_player(db, player.userId, currency)
-    balance_cents = to_cents(w.balance) + int(amount)
-    w.balance = from_cents(balance_cents)
-    db.commit()
+    if not _hash_ok(token, bank.BSG_PASS_KEY, hash):
+        payload = (
+            {"result": "failed", "code": 401, "reason": "invalid hash", "request": req_fields}
+            if protocol == "json" else envelope_fail(401, "invalid hash", request_fields=req_fields)
+        )
+        return _media_response(payload, protocol)
 
-    return xml_response({"USERID": userId, "BONUSID": bonusId, "AMOUNT": amount, "HASH": hash, "bankId": bank_id}, {"RESULT": "OK"})
+    sub = decode_token(token)
+    if not sub or "uid" not in sub:
+        payload = (
+            {"result": "failed", "code": 401, "reason": "invalid token", "request": req_fields}
+            if protocol == "json" else envelope_fail(401, "invalid token", request_fields=req_fields)
+        )
+        return _media_response(payload, protocol)
+
+    # TODO: read real wallet balance(s). For now return 0.00 in USD.
+    if protocol == "json":
+        return _media_response(
+            {"result": "ok", "balance": {"amount": "0.00", "currency": bank.BSG_DEFAULT_CURRENCY}, "request": req_fields},
+            protocol,
+        )
+
+    xml_inner = f"<response><result>ok</result><balance>0.00</balance><currency>{bank.BSG_DEFAULT_CURRENCY}</currency></response>"
+    xml = envelope_ok(xml_inner, request_fields=req_fields)
+    return _media_response(xml, protocol)
 
 
 @router.get("/bonusWin")
 async def bonus_win(
-    userId: str,
-    bonusId: str,
-    amount: str,
-    transactionId: str,
-    hash: str,
-    bankId: str | None = None,
-    status: str | None = None,
-    gameId: str | None = None,
-    roundId: str | None = None,
-    isRoundFinished: str | None = None,
-    gameSessionId: str | None = None,
-    clientType: str | None = None,
+    request: Request,
+    bankId: int | None = None,
     token: str | None = None,
+    hash: str | None = None,
     db: Session = Depends(get_db),
 ):
-    bank_id = resolve_bank_id(bankId)
-    bank = get_bank_settings(bank_id)
-    hash_str = f"{userId}{bonusId}{amount}{bank.BSG_PASS_KEY}"
-    debug(f"BONUS_WIN: bankId={bank_id} uid={userId} bonusId={bonusId} amount={amount} tx={transactionId} calc_md5({hash_str})")
-    if md5_hex(hash_str) != hash.lower():
-        return xml_response(
-            {"USERID": userId, "BONUSID": bonusId, "AMOUNT": amount, "TRANSACTIONID": transactionId, "HASH": hash, "STATUS": status, "bankId": bank_id},
-            {"RESULT": "ERROR", "CODE": 500},
+    resolved_bank_id = resolve_bank_id(bankId)
+    bank = get_bank_settings(resolved_bank_id)
+    protocol = (bank.BSG_PROTOCOL or "xml").lower()
+    req_fields = _echo_fields(token, hash)
+
+    if not token or not hash:
+        payload = (
+            {"result": "failed", "code": 400, "reason": "missing token or hash", "request": req_fields}
+            if protocol == "json" else envelope_fail(400, "missing token or hash", request_fields=req_fields)
         )
+        return _media_response(payload, protocol)
 
-    player = db.query(Player).filter(Player.userId == int(userId)).first()
-    if not player:
-        return xml_response({"USERID": userId, "bankId": bank_id}, {"RESULT": "ERROR", "CODE": 631})
+    if not _hash_ok(token, bank.BSG_PASS_KEY, hash):
+        payload = (
+            {"result": "failed", "code": 401, "reason": "invalid hash", "request": req_fields}
+            if protocol == "json" else envelope_fail(401, "invalid hash", request_fields=req_fields)
+        )
+        return _media_response(payload, protocol)
 
-    currency = bank.BSG_DEFAULT_CURRENCY or bsg_settings.BSG_DEFAULT_CURRENCY
-    w = wallet_for_player(db, player.userId, currency)
-    balance_cents = to_cents(w.balance) + int(amount)
-    w.balance = from_cents(balance_cents)
-    db.commit()
+    sub = decode_token(token)
+    if not sub or "uid" not in sub:
+        payload = (
+            {"result": "failed", "code": 401, "reason": "invalid token", "request": req_fields}
+            if protocol == "json" else envelope_fail(401, "invalid token", request_fields=req_fields)
+        )
+        return _media_response(payload, protocol)
 
-    return xml_response(
-        {"USERID": userId, "BONUSID": bonusId, "AMOUNT": amount, "TRANSACTIONID": transactionId, "HASH": hash, "STATUS": status, "bankId": bank_id},
-        {"RESULT": "OK", "BALANCE": balance_cents},
-    )
+    if protocol == "json":
+        return _media_response({"result": "ok", "bankId": resolved_bank_id, "request": req_fields}, protocol)
+    xml = envelope_ok("<response><result>ok</result></response>", request_fields=req_fields)
+    return _media_response(xml, protocol)
+
+
+@router.get("/bonusRelease")
+async def bonus_release(
+    request: Request,
+    bankId: int | None = None,
+    token: str | None = None,
+    hash: str | None = None,
+    db: Session = Depends(get_db),
+):
+    resolved_bank_id = resolve_bank_id(bankId)
+    bank = get_bank_settings(resolved_bank_id)
+    protocol = (bank.BSG_PROTOCOL or "xml").lower()
+    req_fields = _echo_fields(token, hash)
+
+    if not token or not hash:
+        payload = (
+            {"result": "failed", "code": 400, "reason": "missing token or hash", "request": req_fields}
+            if protocol == "json" else envelope_fail(400, "missing token or hash", request_fields=req_fields)
+        )
+        return _media_response(payload, protocol)
+
+    if not _hash_ok(token, bank.BSG_PASS_KEY, hash):
+        payload = (
+            {"result": "failed", "code": 401, "reason": "invalid hash", "request": req_fields}
+            if protocol == "json" else envelope_fail(401, "invalid hash", request_fields=req_fields)
+        )
+        return _media_response(payload, protocol)
+
+    sub = decode_token(token)
+    if not sub or "uid" not in sub:
+        payload = (
+            {"result": "failed", "code": 401, "reason": "invalid token", "request": req_fields}
+            if protocol == "json" else envelope_fail(401, "invalid token", request_fields=req_fields)
+        )
+        return _media_response(payload, protocol)
+
+    if protocol == "json":
+        return _media_response({"result": "ok", "bankId": resolved_bank_id, "request": req_fields}, protocol)
+    xml = envelope_ok("<response><result>ok</result></response>", request_fields=req_fields)
+    return _media_response(xml, protocol)
+
+
+@router.get("/account")
+async def account_info(
+    request: Request,
+    bankId: int | None = None,
+    token: str | None = None,
+    hash: str | None = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Public (unregistered) account info endpoint. For now we just prove the
+    integration is alive. Flesh out as needed by the provider.
+    """
+    resolved_bank_id = resolve_bank_id(bankId)
+    bank = get_bank_settings(resolved_bank_id)
+    protocol = (bank.BSG_PROTOCOL or "xml").lower()
+    req_fields = _echo_fields(token, hash)
+
+    # This endpoint might not require token/hash, but we'll accept and echo.
+    if protocol == "json":
+        return _media_response({"result": "ok", "bankId": resolved_bank_id, "request": req_fields}, protocol)
+
+    xml = envelope_ok("<response><result>ok</result></response>", request_fields=req_fields)
+    return _media_response(xml, protocol)

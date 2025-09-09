@@ -1,77 +1,66 @@
+# igw/app/utils/security.py
+from __future__ import annotations
+
+import json
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Dict, Optional
 
-from jose import jwt
+import jwt  # PyJWT
+from igw.app.config import settings
 
-# Prefer passlib+bcrypt for password hashing
-try:
-    from passlib.context import CryptContext
-
-    _pwd_context: Optional[CryptContext] = CryptContext(
-        schemes=["bcrypt"], deprecated="auto"
-    )
-except Exception:  # pragma: no cover
-    _pwd_context = None
-
-from ..config import settings
-
-JWT_ALGO = "HS256"
+_ALG = "HS256"
 
 
-def hash_password(plain: str) -> str:
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def create_token(
+    claims: Dict[str, Any],
+    *,
+    expires_minutes: Optional[int] = None,
+) -> str:
     """
-    Hash a plaintext password for local/email-password accounts.
-    If passlib/bcrypt is unavailable, fall back to a flagged SHA256 (less secure).
+    Build a JWT:
+      - 'sub' MUST be a string (PyJWT requirement), so we set it from uid if present.
+      - include your claims at the top level (uid, type, provider, bankId, gameId, etc.)
+      - iat/exp added
+      - if claims contains 'exp_m', it takes precedence over 'expires_minutes'
     """
-    if not isinstance(plain, str):
-        raise TypeError("plain password must be a string")
+    payload: Dict[str, Any] = dict(claims) if claims else {}
+    uid = payload.get("uid")
+    sub_str = str(uid) if uid is not None else payload.get("sub") or "user"
+    payload["sub"] = sub_str
 
-    if _pwd_context:
-        return _pwd_context.hash(plain)
+    now = _utcnow()
+    exp_m = payload.pop("exp_m", None) or expires_minutes or 60
+    payload["iat"] = int(now.timestamp())
+    payload["exp"] = int((now + timedelta(minutes=int(exp_m))).timestamp())
 
-    # Fallback (only if passlib/bcrypt not available)
-    import hashlib
-    return "sha256$" + hashlib.sha256(plain.encode("utf-8")).hexdigest()
+    token = jwt.encode(payload, settings.JWT_SIGNING_KEY, algorithm=_ALG)
+    return token
 
 
-def verify_password(plain: str, hashed: str) -> bool:
+def decode_token(token: str) -> Optional[Dict[str, Any]]:
     """
-    Verify a plaintext password against a stored hash.
-    Supports passlib bcrypt and the SHA256 fallback above.
+    Verify & decode. Returns payload dict or None if invalid/expired.
     """
-    if not isinstance(hashed, str):
-        return False
-
-    # OAuth-only accounts may store a sentinel like "oauth:<id>"
-    if hashed.startswith("oauth:"):
-        return False
-
-    if _pwd_context and (hashed.startswith("$2a$") or hashed.startswith("$2b$") or hashed.startswith("$2y$")):
-        try:
-            return _pwd_context.verify(plain, hashed)
-        except Exception:
-            return False
-
-    if hashed.startswith("sha256$"):
-        import hashlib
-        digest = "sha256$" + hashlib.sha256(plain.encode("utf-8")).hexdigest()
-        return digest == hashed
-
-    # Unknown format
-    return False
+    try:
+        payload = jwt.decode(token, settings.JWT_SIGNING_KEY, algorithms=[_ALG])
+        return payload
+    except Exception as e:
+        # Optional: log for debugging
+        # print(f"[JWT] decode failed: {e}")
+        return None
 
 
-def create_token(sub: str, extra: dict | None = None, ttl_minutes: int = 60 * 24) -> str:
+def extract_subject(payload: Dict[str, Any]) -> Optional[Any]:
     """
-    Create a signed JWT for sessions.
-    `sub` should be the internal player ID as a string.
+    Compatibility helper:
+      - if 'sub' is string -> return it
+      - if 'sub' was older dict (legacy tokens) -> return dict
     """
-    now = datetime.now(tz=timezone.utc)
-    payload = {
-        "sub": sub,
-        "iat": int(now.timestamp()),
-        "exp": int((now + timedelta(minutes=ttl_minutes)).timestamp()),
-    }
-    if extra:
-        payload.update(extra)
-    return jwt.encode(payload, settings.jwt_signing_key, algorithm=JWT_ALGO)
+    if not payload:
+        return None
+    sub = payload.get("sub")
+    return sub
