@@ -1,3 +1,4 @@
+# igw/app/routes/oauth_instagram.py
 from __future__ import annotations
 
 from urllib.parse import urlencode
@@ -9,13 +10,10 @@ from sqlalchemy.orm import Session
 
 from igw.app.config import settings
 from igw.app.db import get_db
-from igw.app.models import Player, UserSession
+from igw.app.models import Player, UserSession, Wallet  # <- add Wallet
 from igw.app.utils.account import ensure_wallets_for_user
 from igw.app.utils.security import create_token
-from igw.app.providers.bsg.settings import (
-    bsg_settings,
-    get_bank_settings,
-)
+from igw.app.providers.bsg.settings import bsg_settings, get_bank_settings  # <- new
 
 router = APIRouter(prefix="/oauth/instagram", tags=["oauth-instagram"])
 
@@ -34,16 +32,15 @@ def _require_basic_display_config():
 @router.get("/start")
 async def instagram_login():
     """
-    Instagram Basic Display OAuth — Instagram-branded consent UI.
+    Instagram Basic Display OAuth — shows Instagram-branded consent UI.
     """
     _require_basic_display_config()
 
-    # Basic Display uses api.instagram.com
     base = "https://api.instagram.com/oauth/authorize"
     params = {
         "client_id": settings.IGBD_APP_ID,
         "redirect_uri": settings.IGBD_REDIRECT_URI,
-        "scope": settings.IGBD_SCOPES,  # e.g. instagram_business_basic
+        "scope": settings.IGBD_SCOPES,  # you observed instagram_business_basic works in your app setup
         "response_type": "code",
     }
     url = f"{base}?{urlencode(params)}"
@@ -59,9 +56,9 @@ async def instagram_callback(
     db: Session = Depends(get_db),
 ):
     """
-    Exchange ?code -> access_token, read user id/username,
-    upsert Player, ensure wallets, create a lobby session,
-    create a BSG game session/token, and render a simple page.
+    Exchange ?code -> access token, read username, upsert Player,
+    ensure two wallets (USD,VND), create lobby & BSG game sessions,
+    and render an HTML summary with wallet balances + CW start link.
     """
     _require_basic_display_config()
 
@@ -71,7 +68,7 @@ async def instagram_callback(
         raise HTTPException(status_code=400, detail="Missing ?code")
 
     async with httpx.AsyncClient(timeout=25) as cx:
-        # 1) Token exchange
+        # 1) Exchange code for access token (POST form)
         token_resp = await cx.post(
             "https://api.instagram.com/oauth/access_token",
             data={
@@ -83,34 +80,26 @@ async def instagram_callback(
             },
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
-        try:
-            token_resp.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=400, detail=f"Token exchange failed: {e.response.text}")
-
+        token_resp.raise_for_status()
         tok = token_resp.json()
         access_token = tok.get("access_token")
         ig_user_id = tok.get("user_id")
         if not access_token or not ig_user_id:
             raise HTTPException(status_code=400, detail=f"Malformed token response: {tok}")
 
-        # 2) Fetch username
+        # 2) Fetch username via Graph API
         me_resp = await cx.get(
             f"https://graph.instagram.com/{ig_user_id}",
             params={"fields": "id,username", "access_token": access_token},
         )
-        try:
-            me_resp.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=400, detail=f"Fetch IG user failed: {e.response.text}")
-
+        me_resp.raise_for_status()
         me = me_resp.json()
         username = me.get("username") or f"ig_{ig_user_id}"
 
     # 3) Upsert Player
     player = db.query(Player).filter(Player.ext_user_id == str(ig_user_id)).first()
     if not player:
-        email = f"{username}@instagram.com"  # placeholder
+        email = f"{username}@instagram.com"  # placeholder policy you requested
         player = Player(
             user_name=username,
             ext_user_id=str(ig_user_id),
@@ -122,9 +111,13 @@ async def instagram_callback(
         db.flush()
         ensure_wallets_for_user(db, player.userId)
 
-    # 4) Create a lobby session token (for your site)
+    # Fetch wallets (USD & VND) to show balances
+    wallets = db.query(Wallet).filter(Wallet.userId == player.userId).all()
+    by_ccy = {w.currency_code.upper(): w for w in wallets}
+
+    # 4) Create lobby session (JWT)
     lobby_token = create_token({"uid": player.userId, "type": "lobby"})
-    sess_lobby = UserSession(
+    lobby_sess = UserSession(
         userId=player.userId,
         token=lobby_token,
         session_type="lobby",
@@ -132,51 +125,74 @@ async def instagram_callback(
         status="active",
         Login_IP=(request.client.host if request and request.client else None),
     )
-    db.add(sess_lobby)
+    db.add(lobby_sess)
 
-    # 5) Create a BSG game token + session (this is the one to pass to BSG)
-    base_cfg = bsg_settings()
-    default_bank_id = base_cfg.BSG_DEFAULT_BANK_ID or 6111
-    bank = get_bank_settings(int(default_bank_id))
+    # 5) Create a BSG game token + session (this is the token BSG will send back to /betsoft/authenticate)
+    # Load bank settings (default bank if none specified)
+    base = bsg_settings()
+    bank = get_bank_settings(base.BSG_DEFAULT_BANK_ID)
 
-    game_token = create_token(
-        {"uid": player.userId, "type": "game", "provider": "bsg", "bankId": bank.BANK_ID, "gameId": bank.BSG_DEFAULT_GAME_ID},
-        exp_minutes=bank.BSG_TOKEN_GAME_EXP_MIN,
-    )
-    sess_game = UserSession(
+    game_claims = {
+        "uid": player.userId,
+        "type": "game",
+        "provider": "bsg",
+        "bankId": bank.BSG_BANK_ID,
+        "gameId": bank.BSG_DEFAULT_GAME_ID,
+        "exp_m": 60,  # 60 minutes validity by default
+    }
+    bsg_token = create_token(game_claims)
+    game_sess = UserSession(
         userId=player.userId,
-        token=game_token,
+        token=bsg_token,
         session_type="game",
         provider="bsg",
         status="active",
         Login_IP=(request.client.host if request and request.client else None),
-        meta={"bankId": bank.BANK_ID, "gameId": bank.BSG_DEFAULT_GAME_ID},
+        meta={"bankId": bank.BSG_BANK_ID, "gameId": bank.BSG_DEFAULT_GAME_ID},
     )
-    db.add(sess_game)
+    db.add(game_sess)
     db.commit()
 
-    # 6) Build Start Game URL using BSG token (not the lobby token)
-    start_host = bank.BSG_CW_START_BASE or base_cfg.BSG_CW_START_BASE_DEFAULT or "https://5for5media-ng-copy.nucleusgaming.com"
-    start_url = (
-        f"{start_host}/cwstartgamev2.do?"
-        f"bankId={bank.BANK_ID}"
-        f"&gameId={bank.BSG_DEFAULT_GAME_ID}"
-        f"&mode=real"
-        f"&token={game_token}"
-        f"&lang=en"
+    # 6) Build CW game start URL (uses the **BSG token**, not the lobby token)
+    start_host = (
+        bank.BSG_CW_START_BASE
+        or base.BSG_CW_START_BASE_DEFAULT
+        or "https://5for5media-ng-copy.nucleusgaming.com"
     )
+    cw_query = urlencode(
+        {
+            "bankId": bank.BSG_BANK_ID,
+            "gameId": bank.BSG_DEFAULT_GAME_ID,
+            "mode": "real",
+            "token": bsg_token,
+            "lang": "en",
+        }
+    )
+    start_url = f"{start_host}/cwstartgamev2.do?{cw_query}"
+
+    # 7) Simple confirmation page w/ balances (kept pretty)
+    usd_bal = f"{by_ccy.get('USD').balance:.2f}" if by_ccy.get("USD") else "0.00"
+    vnd_bal = f"{by_ccy.get('VND').balance:.2f}" if by_ccy.get("VND") else "0.00"
 
     html = f"""
     <style>
-      body{{font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Arial;margin:40px;line-height:1.45}}
-      pre{{background:#f6f8fa;padding:14px;border-radius:8px;overflow:auto}}
-      a.button{{display:inline-block;padding:10px 14px;border-radius:8px;text-decoration:none;border:1px solid #d0d7de}}
+      body{{font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Arial;margin:40px;line-height:1.5}}
+      pre{{background:#0b1020;color:#e6edf3;padding:16px;border-radius:8px;overflow:auto}}
+      .row span{{display:inline-block;min-width:140px;color:#9fb3c8}}
+      a.button{{display:inline-block;margin-top:12px;padding:10px 14px;border-radius:8px;border:1px solid #cbd5e1;text-decoration:none}}
+      h2{{margin-bottom:6px}}
     </style>
     <h2>Instagram login — success</h2>
-    <pre>user:   {{ "id": {player.userId}, "username": "{player.user_name}" }}</pre>
-    <pre>lobby_token:\n{lobby_token}</pre>
-    <pre>bsg_game_token:\n{game_token}</pre>
-    <p><a class="button" href="{start_url}" target="_blank">Start Test Game (bank {bank.BANK_ID}, game {bank.BSG_DEFAULT_GAME_ID})</a></p>
-    <pre>Launch URL:\n{start_url}</pre>
+    <div class="row"><span>User ID:</span> {player.userId}</div>
+    <div class="row"><span>Username:</span> {player.user_name}</div>
+    <div class="row"><span>Wallet USD:</span> {usd_bal}</div>
+    <div class="row"><span>Wallet VND:</span> {vnd_bal}</div>
+    <div class="row"><span>Lobby token:</span></div>
+    <pre>{lobby_token}</pre>
+    <div class="row"><span>BSG token:</span></div>
+    <pre>{bsg_token}</pre>
+    <div class="row"><span>Start Game URL:</span></div>
+    <pre>{start_url}</pre>
+    <a class="button" href="{start_url}" target="_blank" rel="noopener">Launch test game</a>
     """
     return HTMLResponse(html)

@@ -1,136 +1,113 @@
-# igw/app/providers/bsg/settings.py
 from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
-from fastapi import HTTPException
-from pydantic import Field
+from dotenv import dotenv_values
+from pydantic import BaseModel, Field, AliasChoices
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-# Folder layout:
-# igw/app/providers/bsg/.env                -> base settings
-# igw/app/providers/bsg/<bankId>/.env       -> per-bank settings (e.g., 6111/.env)
 
 _BASE_DIR = Path(__file__).resolve().parent
 
 
-class BSGBaseSettings(BaseSettings):
+class BsgBaseSettings(BaseSettings):
+    """
+    Provider-wide defaults from igw/app/providers/bsg/.env
+    """
     model_config = SettingsConfigDict(
         env_file=str(_BASE_DIR / ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )
 
-    # Global defaults (can be omitted in base .env)
     BSG_DEFAULT_BANK_ID: Optional[int] = None
     BSG_CW_START_BASE_DEFAULT: Optional[str] = None
-    BSG_TOKEN_GAME_EXP_MIN: int = 60  # minutes
+
+    # Fallback token lifetimes if a bank doesn't specify its own values
+    BSG_TOKEN_GAME_EXP_MIN_DEFAULT: int = 60
+    BSG_TOKEN_LOBBY_EXP_MIN_DEFAULT: int = 1440
 
 
-class BankModel(BaseSettings):
+class BankModel(BaseModel):
     """
-    Per-bank settings. We map BANK_ID from env key BSG_BANK_ID to match your .env.
-    Example igw/app/providers/bsg/6111/.env:
-      BSG_BANK_ID=6111
-      BSG_PROTOCOL=xml
-      BSG_PASS_KEY=OkykCptT7qPBT8sN
-      BSG_DEFAULT_GAME_ID=30217
-      BSG_DEFAULT_CURRENCY=USD
-      BSG_CW_START_BASE=https://5for5media-ng-copy.nucleusgaming.com
+    Per-bank configuration from igw/app/providers/bsg/<bankId>/.env
+    Accepts legacy names via aliases.
     """
-    model_config = SettingsConfigDict(
-        env_file=None,                # we fill in per call
-        env_file_encoding="utf-8",
-        extra="ignore",
+    BSG_BANK_ID: int = Field(validation_alias=AliasChoices("BSG_BANK_ID", "bsg_bank_id", "BANK_ID"))
+    BSG_PASS_KEY: str = Field(validation_alias=AliasChoices("BSG_PASS_KEY", "PASS_KEY", "pass_key"))
+    BSG_PROTOCOL: str = Field(default="xml", validation_alias=AliasChoices("BSG_PROTOCOL", "PROTOCOL", "protocol"))
+    BSG_DEFAULT_GAME_ID: int = Field(validation_alias=AliasChoices("BSG_DEFAULT_GAME_ID", "DEFAULT_GAME_ID", "gameId"))
+
+    BSG_CW_START_BASE: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("BSG_CW_START_BASE", "CW_START_BASE", "START_HOST")
+    )
+    BSG_DEFAULT_CURRENCY: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("BSG_DEFAULT_CURRENCY", "DEFAULT_CURRENCY", "currency")
     )
 
-    # NB: your env uses BSG_BANK_ID, we alias it to BANK_ID
-    BANK_ID: int = Field(..., alias="BSG_BANK_ID")
-
-    BSG_PROTOCOL: str = "xml"  # "xml" or "json"
-    BSG_PASS_KEY: str
-
-    BSG_DEFAULT_GAME_ID: int
-    BSG_DEFAULT_CURRENCY: str = "USD"
-
-    # Optional: override the CW start host for this bank
-    BSG_CW_START_BASE: Optional[str] = None
-
-
-def _bank_dir(bank_id: int) -> Path:
-    return _BASE_DIR / str(bank_id)
-
-
-def _bank_env_path(bank_id: int) -> Path:
-    return _bank_dir(bank_id) / ".env"
+    # Per-bank overrides for token lifetimes (minutes)
+    BSG_TOKEN_GAME_EXP_MIN: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices("BSG_TOKEN_GAME_EXP_MIN", "TOKEN_GAME_EXP_MIN")
+    )
+    BSG_TOKEN_LOBBY_EXP_MIN: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices("BSG_TOKEN_LOBBY_EXP_MIN", "TOKEN_LOBBY_EXP_MIN")
+    )
 
 
 @lru_cache
-def bsg_settings() -> BSGBaseSettings:
-    s = BSGBaseSettings()
-    env_path = Path(BSGBaseSettings.model_config["env_file"])  # type: ignore[index]
+def bsg_settings() -> BsgBaseSettings:
+    s = BsgBaseSettings()
+    env_path = Path(BsgBaseSettings.model_config["env_file"])  # type: ignore[index]
     print(f"[BSG] Loaded base settings (.env={'found' if env_path.exists() else 'missing'}) from: {env_path}")
     return s
 
 
+def _bank_env_path(bank_id: int) -> Path:
+    return _BASE_DIR / str(bank_id) / ".env"
+
+
 def list_available_banks() -> List[int]:
-    ids: List[int] = []
+    banks: List[int] = []
     for child in _BASE_DIR.iterdir():
-        if not child.is_dir():
-            continue
-        if not child.name.isdigit():
-            continue
-        if (_BASE_DIR / child.name / ".env").exists():
-            ids.append(int(child.name))
-    return sorted(ids)
+        if child.is_dir() and child.name.isdigit() and (_BASE_DIR / child.name / ".env").exists():
+            banks.append(int(child.name))
+    return sorted(banks)
 
 
-@lru_cache
-def get_bank_settings(bank_id: int) -> BankModel:
-    env_file = _bank_env_path(bank_id)
-    if not env_file.exists():
-        raise HTTPException(status_code=500, detail=f"Bank env not found for {bank_id}: {env_file}")
-    m = BankModel.model_validate({}, context=None)  # create instance with defaults
-    # rebuild with proper env_file through model_copy(update=...)
-    m.model_config = SettingsConfigDict(
-        env_file=str(env_file),
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
-    # Reconstruct with the env file applied
-    m = BankModel()  # pydantic-settings reads env_file from model_config
-    # Force a load by reassigning model_config to ensure env_file is used
-    m.model_config = SettingsConfigDict(
-        env_file=str(env_file),
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
-    # Finally instantiate again to pick env values
-    m = BankModel()
-    print(f"[BSG] Loaded bank settings (.env={'found' if env_file.exists() else 'missing'}) from: {env_file}")
-    return m
-
-
-def resolve_bank_id(incoming_bank_id: Optional[int]) -> int:
-    """
-    Decide which bank id to use:
-      1) use incoming if provided and exists,
-      2) else use base default if set and exists,
-      3) else fall back to the first available configured bank,
-      4) else 500.
-    """
-    available = set(list_available_banks())
-
-    if incoming_bank_id and incoming_bank_id in available:
-        return incoming_bank_id
-
+def resolve_bank_id(query_param_bank_id: Optional[int]) -> int:
+    if query_param_bank_id:
+        return int(query_param_bank_id)
     base = bsg_settings()
-    if base.BSG_DEFAULT_BANK_ID and base.BSG_DEFAULT_BANK_ID in available:
+    if base.BSG_DEFAULT_BANK_ID:
         return int(base.BSG_DEFAULT_BANK_ID)
+    banks = list_available_banks()
+    if not banks:
+        raise RuntimeError("No BSG bank directories (.env) found")
+    return banks[0]
 
-    if available:
-        return sorted(available)[0]
 
-    raise HTTPException(status_code=500, detail="No BSG banks configured")
+def get_bank_settings(bank_id: Optional[int]) -> BankModel:
+    resolved = resolve_bank_id(bank_id)
+    env_path = _bank_env_path(resolved)
+
+    env: Dict[str, str] = {}
+    if env_path.exists():
+        env = {k: v for k, v in dotenv_values(env_path).items() if v is not None}
+
+    # Ensure required id is present even if legacy names were used
+    env.setdefault("BSG_BANK_ID", str(resolved))
+
+    try:
+        model = BankModel.model_validate(env)
+    except Exception as e:
+        missing = ", ".join(
+            k for k in ("BSG_BANK_ID", "BSG_PASS_KEY", "BSG_DEFAULT_GAME_ID") if k not in env
+        )
+        raise RuntimeError(f"Invalid bank .env at {env_path}. Missing keys: {missing}. Error: {e}") from e
+
+    return model
