@@ -97,13 +97,12 @@ async def authenticate(
     bank = get_bank_settings(bank_id)
     protocol = (bank.BSG_PROTOCOL or "xml").lower()
 
-    # This flow implements the XML contract; JSON support can be added later.
     if protocol != "xml":
         xml = envelope_fail(400, "Bank protocol mismatch: expected xml",
                             request_fields=_echo_fields(token, hash))
         return Response(content=xml, media_type="application/xml")
 
-    # 1) Hash check
+    # 1) Hash check (MD5(token + PASS_KEY))
     if not _hash_ok(token, bank.BSG_PASS_KEY, hash):
         xml = envelope_fail(401, "INVALID_HASH", request_fields=_echo_fields(token, hash))
         return Response(content=xml, media_type="application/xml")
@@ -387,23 +386,81 @@ async def bonus_release(
 @router.get("/account")
 async def account_info(
     request: Request,
-    bankId: int | None = None,
-    token: str | None = None,
-    hash: str | None = None,
+    bankId: int | None = Query(None),
+    userId: int | None = Query(None),
+    hash: str | None = Query(None),
     db: Session = Depends(get_db),
 ):
     """
-    Public (unregistered) account info endpoint. For now we just prove the
-    integration is alive. Flesh out as needed by the provider.
+    BSG 'Get Account info' — for XML banks must return EXTSYSTEM with:
+      RESULT=OK, USERID, USERNAME, CURRENCY, BALANCE (minor units).
+    Request is (bankId, userId, hash) where hash = MD5(userId + PASS_KEY).
     """
     resolved_bank_id = resolve_bank_id(bankId)
     bank = get_bank_settings(resolved_bank_id)
     protocol = (bank.BSG_PROTOCOL or "xml").lower()
-    req_fields = _echo_fields(token, hash)
 
-    # This endpoint might not require token/hash, but we'll accept and echo.
-    if protocol == "json":
-        return _media_response({"result": "ok", "bankId": resolved_bank_id, "request": req_fields}, protocol)
+    # Build REQUEST echo in the EXTSYSTEM envelope (USERID + HASH for this endpoint)
+    req_fields = {"USERID": str(userId) if userId is not None else "", "HASH": hash or ""}
 
-    xml = envelope_ok("<response><result>ok</result></response>", request_fields=req_fields)
-    return _media_response(xml, protocol)
+    # Only change this endpoint; keep others untouched.
+    if protocol != "xml":
+        # Minimal JSON fallback (kept for future JSON banks)
+        if userId is None or not hash:
+            return _media_response(
+                {"result": "failed", "code": 400, "reason": "missing userId or hash", "request": req_fields},
+                "json",
+            )
+        expected = md5_hex(f"{userId}{bank.BSG_PASS_KEY}")
+        if expected.lower() != hash.lower():
+            return _media_response(
+                {"result": "failed", "code": 401, "reason": "invalid hash", "request": req_fields},
+                "json",
+            )
+        player: Player | None = db.query(Player).filter(Player.userId == userId).first()
+        if not player:
+            return _media_response(
+                {"result": "failed", "code": 404, "reason": "user not found", "request": req_fields},
+                "json",
+            )
+        currency = bank.BSG_DEFAULT_CURRENCY or "USD"
+        balance_cents = _wallet_cents(db, userId, currency)
+        return _media_response(
+            {
+                "result": "ok",
+                "userId": userId,
+                "username": player.user_name or f"user_{userId}",
+                "currency": currency,
+                "balance_cents": balance_cents,
+                "request": req_fields,
+            },
+            "json",
+        )
+
+    # XML flow
+    if userId is None or not hash:
+        xml = envelope_fail(400, "missing userId or hash", request_fields=req_fields)
+        return Response(content=xml, media_type="application/xml")
+
+    expected = md5_hex(f"{userId}{bank.BSG_PASS_KEY}")
+    if expected.lower() != (hash or "").lower():
+        xml = envelope_fail(401, "INVALID_HASH", request_fields=req_fields)
+        return Response(content=xml, media_type="application/xml")
+
+    player: Player | None = db.query(Player).filter(Player.userId == userId).first()
+    if not player:
+        xml = envelope_fail(404, "USER_NOT_FOUND", request_fields=req_fields)
+        return Response(content=xml, media_type="application/xml")
+
+    currency = bank.BSG_DEFAULT_CURRENCY or "USD"
+    balance_cents = _wallet_cents(db, userId, currency)
+
+    # EXTSYSTEM OK envelope with account snapshot
+    xml = envelope_ok(
+        user_id=userId,
+        username=player.user_name or f"user_{userId}",
+        currency=currency,
+        balance_cents=balance_cents,
+        request_fields=req_fields,
+    )
+    return Response(content=xml, media_type="application/xml")
