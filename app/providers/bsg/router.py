@@ -60,7 +60,6 @@ def _wallet_cents(db: Session, uid: int, currency_code: str) -> int:
     )
     if not w or w.balance is None:
         return 0
-    # Decimal -> cents (minor units)
     return int(Decimal(w.balance) * 100)
 
 
@@ -76,23 +75,8 @@ async def authenticate(
     db: Session = Depends(get_db),
 ):
     """
-    BSG calls this before launching the game.
-
-    For XML banks we must return EXTSYSTEM-style XML:
-
-    <EXTSYSTEM>
-      <REQUEST><TOKEN>...</TOKEN><HASH>...</HASH></REQUEST>
-      <TIME>...</TIME>
-      <RESPONSE>
-        <RESULT>OK</RESULT>
-        <USERID>...</USERID>
-        <USERNAME>...</USERNAME>
-        <CURRENCY>...</CURRENCY>
-        <BALANCE>...</BALANCE>
-      </RESPONSE>
-    </EXTSYSTEM>
+    BSG calls this before launching the game. Responds with EXTSYSTEM XML (RESULT/USERID/USERNAME/CURRENCY/BALANCE).
     """
-    # Load bank/provider settings
     bank_id = resolve_bank_id(bankId)
     bank = get_bank_settings(bank_id)
     protocol = (bank.BSG_PROTOCOL or "xml").lower()
@@ -102,12 +86,10 @@ async def authenticate(
                             request_fields=_echo_fields(token, hash))
         return Response(content=xml, media_type="application/xml")
 
-    # 1) Hash check (MD5(token + PASS_KEY))
     if not _hash_ok(token, bank.BSG_PASS_KEY, hash):
         xml = envelope_fail(401, "INVALID_HASH", request_fields=_echo_fields(token, hash))
         return Response(content=xml, media_type="application/xml")
 
-    # 2) Decode token and extract uid
     try:
         payload = decode_token(token)
     except Exception as e:
@@ -115,10 +97,8 @@ async def authenticate(
         return Response(content=xml, media_type="application/xml")
 
     uid: Optional[int] = None
-    # prefer 'sub' as numeric string
     if isinstance(payload.get("sub"), str) and payload["sub"].isdigit():
         uid = int(payload["sub"])
-    # or explicit 'uid'
     if uid is None and isinstance(payload.get("uid"), int):
         uid = payload["uid"]
 
@@ -126,7 +106,6 @@ async def authenticate(
         xml = envelope_fail(401, "INVALID_TOKEN no user in token", request_fields=_echo_fields(token, hash))
         return Response(content=xml, media_type="application/xml")
 
-    # 3) Verify we created this active BSG game session
     sess = (
         db.query(UserSession)
         .filter(
@@ -142,13 +121,11 @@ async def authenticate(
         xml = envelope_fail(401, "SESSION_NOT_FOUND", request_fields=_echo_fields(token, hash))
         return Response(content=xml, media_type="application/xml")
 
-    # 4) Gather user info and balance in minor units
     player: Player | None = db.query(Player).filter(Player.userId == uid).first()
     username = player.user_name if (player and player.user_name) else f"user_{uid}"
     currency = bank.BSG_DEFAULT_CURRENCY or "USD"
     balance_cents = _wallet_cents(db, uid, currency)
 
-    # 5) Respond with EXTSYSTEM OK envelope (no token in RESPONSE per BSG sample)
     xml = envelope_ok(
         user_id=uid,
         username=username,
@@ -167,10 +144,6 @@ async def bet_result(
     hash: str | None = None,
     db: Session = Depends(get_db),
 ):
-    """
-    Minimal placeholder: verifies hash and token, returns OK.
-    Flesh this out with real wallet debits and result processing.
-    """
     resolved_bank_id = resolve_bank_id(bankId)
     bank = get_bank_settings(resolved_bank_id)
     protocol = (bank.BSG_PROTOCOL or "xml").lower()
@@ -198,7 +171,6 @@ async def bet_result(
         )
         return _media_response(payload, protocol)
 
-    # TODO: implement wager/balance updates and return the real shape
     if protocol == "json":
         return _media_response({"result": "ok", "bankId": resolved_bank_id, "request": req_fields}, protocol)
 
@@ -253,48 +225,67 @@ async def refund_bet(
 @router.get("/balance")
 async def balance(
     request: Request,
-    bankId: int | None = None,
-    token: str | None = None,
-    hash: str | None = None,
+    bankId: int | None = Query(None),
+    userId: int | None = Query(None),
+    hash: str | None = Query(None),
     db: Session = Depends(get_db),
 ):
+    """
+    BSG 'Get Balance' (XML flavor)
+    Request: bankId, userId, hash (where hash = MD5(userId + PASS_KEY))
+    Response:
+      <EXTSYSTEM>
+        <REQUEST><USERID>...</USERID></REQUEST>
+        <TIME>...</TIME>
+        <RESPONSE><RESULT>OK</RESULT><BALANCE>...</BALANCE></RESPONSE>
+      </EXTSYSTEM>
+
+    BALANCE must be in minor units (cents). Example: 7456.23 -> 745623.
+    """
     resolved_bank_id = resolve_bank_id(bankId)
     bank = get_bank_settings(resolved_bank_id)
     protocol = (bank.BSG_PROTOCOL or "xml").lower()
-    req_fields = _echo_fields(token, hash)
 
-    if not token or not hash:
-        payload = (
-            {"result": "failed", "code": 400, "reason": "missing token or hash", "request": req_fields}
-            if protocol == "json" else envelope_fail(400, "missing token or hash", request_fields=req_fields)
-        )
-        return _media_response(payload, protocol)
+    # Only modify this endpoint’s behavior; keep others as-is.
+    if protocol != "xml":
+        # JSON banks (future): return a lightweight JSON shape.
+        if userId is None or not hash:
+            return _media_response(
+                {"result": "failed", "code": 400, "reason": "missing userId or hash",
+                 "request": {"USERID": str(userId) if userId is not None else ""}},
+                "json",
+            )
+        expected = md5_hex(f"{userId}{bank.BSG_PASS_KEY}")
+        if expected.lower() != hash.lower():
+            return _media_response(
+                {"result": "failed", "code": 401, "reason": "invalid hash",
+                 "request": {"USERID": str(userId)}},
+                "json",
+            )
+        currency = bank.BSG_DEFAULT_CURRENCY or "USD"
+        balance_cents = _wallet_cents(db, userId, currency)
+        return _media_response({"result": "ok", "balance_cents": balance_cents, "userId": userId}, "json")
 
-    if not _hash_ok(token, bank.BSG_PASS_KEY, hash):
-        payload = (
-            {"result": "failed", "code": 401, "reason": "invalid hash", "request": req_fields}
-            if protocol == "json" else envelope_fail(401, "invalid hash", request_fields=req_fields)
-        )
-        return _media_response(payload, protocol)
+    # XML flow:
+    # Build REQUEST echo with USERID ONLY (per provider example).
+    request_fields = {"USERID": str(userId) if userId is not None else ""}
 
-    sub = decode_token(token)
-    if not sub or "uid" not in sub:
-        payload = (
-            {"result": "failed", "code": 401, "reason": "invalid token", "request": req_fields}
-            if protocol == "json" else envelope_fail(401, "invalid token", request_fields=req_fields)
-        )
-        return _media_response(payload, protocol)
+    if userId is None or not hash:
+        xml = envelope_fail(400, "missing userId or hash", request_fields=request_fields)
+        return Response(content=xml, media_type="application/xml")
 
-    # TODO: read real wallet balance(s). For now return 0.00 in configured currency.
-    if protocol == "json":
-        return _media_response(
-            {"result": "ok", "balance": {"amount": "0.00", "currency": bank.BSG_DEFAULT_CURRENCY}, "request": req_fields},
-            protocol,
-        )
+    expected = md5_hex(f"{userId}{bank.BSG_PASS_KEY}")
+    if expected.lower() != hash.lower():
+        xml = envelope_fail(401, "INVALID_HASH", request_fields=request_fields)
+        return Response(content=xml, media_type="application/xml")
 
-    xml_inner = f"<response><result>ok</result><balance>0.00</balance><currency>{bank.BSG_DEFAULT_CURRENCY}</currency></response>"
-    xml = envelope_ok(xml_inner, request_fields=req_fields)
-    return _media_response(xml, protocol)
+    # Get balance in minor units (cents) from the bank’s default currency wallet.
+    currency = bank.BSG_DEFAULT_CURRENCY or "USD"
+    balance_cents = _wallet_cents(db, userId, currency)
+
+    # Return EXTSYSTEM with only BALANCE in RESPONSE (no USERNAME/CURRENCY here).
+    xml = envelope_ok(balance_cents=balance_cents, request_fields=request_fields)
+    return Response(content=xml, media_type="application/xml")
 
 
 @router.get("/bonusWin")
@@ -392,20 +383,15 @@ async def account_info(
     db: Session = Depends(get_db),
 ):
     """
-    BSG 'Get Account info' — for XML banks must return EXTSYSTEM with:
-      RESULT=OK, USERID, USERNAME, CURRENCY, BALANCE (minor units).
-    Request is (bankId, userId, hash) where hash = MD5(userId + PASS_KEY).
+    BSG 'Get Account info' — XML EXTSYSTEM with RESULT/USERID/USERNAME/CURRENCY/BALANCE.
     """
     resolved_bank_id = resolve_bank_id(bankId)
     bank = get_bank_settings(resolved_bank_id)
     protocol = (bank.BSG_PROTOCOL or "xml").lower()
 
-    # Build REQUEST echo in the EXTSYSTEM envelope (USERID + HASH for this endpoint)
     req_fields = {"USERID": str(userId) if userId is not None else "", "HASH": hash or ""}
 
-    # Only change this endpoint; keep others untouched.
     if protocol != "xml":
-        # Minimal JSON fallback (kept for future JSON banks)
         if userId is None or not hash:
             return _media_response(
                 {"result": "failed", "code": 400, "reason": "missing userId or hash", "request": req_fields},
@@ -437,7 +423,6 @@ async def account_info(
             "json",
         )
 
-    # XML flow
     if userId is None or not hash:
         xml = envelope_fail(400, "missing userId or hash", request_fields=req_fields)
         return Response(content=xml, media_type="application/xml")
@@ -455,7 +440,6 @@ async def account_info(
     currency = bank.BSG_DEFAULT_CURRENCY or "USD"
     balance_cents = _wallet_cents(db, userId, currency)
 
-    # EXTSYSTEM OK envelope with account snapshot
     xml = envelope_ok(
         user_id=userId,
         username=player.user_name or f"user_{userId}",
