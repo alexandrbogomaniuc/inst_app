@@ -134,3 +134,15 @@ def md5_hex_bet(*args, **kwargs) -> str:
     digest = md5_hex(concat)
     print(f"[BSG/betResult] concat='{concat}' expected_md5='{digest}'")
     return digest
+
+
+def md5_hex_refund(user_id: int, casino_tx_id: str, pass_key: str) -> str:
+    """
+    Compute refund hash:
+
+      MD5(userId + casinoTransactionId + passkey)
+    """
+    concat = f"{user_id}{casino_tx_id}{pass_key}"
+    digest = hashlib.md5(concat.encode("utf-8")).hexdigest()
+    print(f"[BSG/refund] concat='{concat}' expected_md5='{digest}'")
+    return digest

@@ -1,178 +1,197 @@
-# -*- coding: utf-8 -*-
-"""
-XML helpers for BSG (XML protocol).
-Keeps the EXTSYSTEM envelope identical across endpoints.
-"""
-
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Dict, Optional
-
-_XML_HDR = '<?xml version="1.0" encoding="UTF-8"?>'
+from html import escape
+from typing import Any, Dict, Iterable, Tuple
 
 
 def _now_str() -> str:
-    # Example: "03 Mar 2023 17:55:21"
-    return datetime.utcnow().strftime("%d %b %Y %H:%M:%S")
+    # e.g. "09 Sep 2025 17:44:21"
+    return datetime.now().strftime("%d %b %Y %H:%M:%S")
 
 
-def _escape(s: str) -> str:
-    return (
-        s.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-        .replace("'", "&apos;")
-    )
-
-
-def _render_request_fields(fields) -> str:
+def _render_request_fields(fields: Any) -> str:
     """
-    Accepts either:
-      - dict like {"USERID": "36", "HASH": "...", "CASINOTRANSACTIONID": "..."}
-      - list/tuple of dicts or (key, value) pairs, e.g.
-          [{"USERID": "36"}, {"CASINOTRANSACTIONID": "2629"}, {"HASH": "..."}]
-          or [("USERID", "36"), ("HASH", "...")]
-    Returns XML of the <REQUEST> block inner nodes.
+    Accepts:
+      - dict[str, str]
+      - list[tuple[str, str]] / iterable of pairs
+      - None
+    and renders inside <REQUEST> ... </REQUEST>.
     """
     if not fields:
-        return ""
+        return "<REQUEST/>"
 
-    # Normalize to a flat dict
-    norm: dict[str, str] = {}
-
+    items: Iterable[Tuple[str, str]]
     if isinstance(fields, dict):
-        norm = {str(k).upper(): "" if v is None else str(v) for k, v in fields.items()}
-    elif isinstance(fields, (list, tuple)):
-        for item in fields:
-            if isinstance(item, dict):
-                for k, v in item.items():
-                    norm[str(k).upper()] = "" if v is None else str(v)
-            elif isinstance(item, (list, tuple)) and len(item) == 2:
-                k, v = item
-                norm[str(k).upper()] = "" if v is None else str(v)
-            # else: ignore unknown shapes
+        items = fields.items()
     else:
-        # last resort: treat as a single value
-        norm["VALUE"] = str(fields)
+        # try to treat it as an iterable of (k, v)
+        items = list(fields)
 
-    parts = []
-    for k, v in norm.items():
-        parts.append(f"<{k}>{v}</{k}>")
-    return "".join(parts)
+    parts = ["<REQUEST>"]
+    for k, v in items:
+        k = escape(str(k)).upper()
+        v = "" if v is None else escape(str(v))
+        parts.append(f"    <{k}>{v}</{k}>")
+    parts.append("</REQUEST>")
+    return "\n".join(parts)
 
 
-def _wrap_extsystem(request_fields_xml: str, response_xml: str) -> str:
+def envelope_fail(code: int, message: str, *, request_fields: Any = None) -> str:
+    req = _render_request_fields(request_fields)
+    msg = escape(str(message))
     return (
-        f"{_XML_HDR}\n"
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
         "<EXTSYSTEM>\n"
-        f"  {request_fields_xml}\n"
+        f"{req}\n"
         f"  <TIME>{_now_str()}</TIME>\n"
-        f"  {response_xml}\n"
+        "  <RESPONSE>\n"
+        "    <RESULT>FAILED</RESULT>\n"
+        f"    <CODE>{code}</CODE>\n"
+        f"    <MESSAGE>{msg}</MESSAGE>\n"
+        "  </RESPONSE>\n"
         "</EXTSYSTEM>"
     )
 
 
-# ---------------------------------------------------------------------------
-# Generic OK / FAIL envelopes used by multiple endpoints
-# ---------------------------------------------------------------------------
-
-def envelope_fail(code: int, message: str, *, request_fields: Optional[Dict[str, str]] = None) -> str:
-    req = _render_request_fields(request_fields)
-    resp = (
-        "<RESPONSE>\n"
-        "  <RESULT>FAILED</RESULT>\n"
-        f"  <CODE>{code}</CODE>\n"
-        f"  <MESSAGE>{_escape(message)}</MESSAGE>\n"
-        "</RESPONSE>"
-    )
-    return _wrap_extsystem(req, resp)
-
-
 def envelope_ok(
+    inner: str | None = None,
     *,
-    # account/auth shape
-    user_id: Optional[int] = None,
-    username: Optional[str] = None,
-    currency: Optional[str] = None,
-    # balance-only shape (when only BALANCE is expected)
-    balance_cents: Optional[int] = None,
-    request_fields: Optional[Dict[str, str]] = None,
+    user_id: int | None = None,
+    username: str | None = None,
+    currency: str | None = None,
+    balance_cents: int | None = None,
+    request_fields: Any = None,
 ) -> str:
     """
-    Flexible OK envelope:
-      - If user_id/username/currency are present, emits those (plus BALANCE if given).
-      - If only balance_cents is provided, emits BALANCE only.
+    Flexible OK wrapper used by auth/account/balance and some placeholders.
+
+    Modes:
+      1) inner XML string is provided -> embed it inside <RESPONSE> ... </RESPONSE>
+      2) user account form (USERID, USERNAME, CURRENCY, BALANCE)
+      3) balance-only form (BALANCE)
+      4) plain OK
     """
     req = _render_request_fields(request_fields)
+    time = _now_str()
 
-    lines = ["<RESPONSE>", "  <RESULT>OK</RESULT>"]
-    if user_id is not None:
-        lines.append(f"  <USERID>{user_id}</USERID>")
-    if username is not None:
-        lines.append(f"  <USERNAME>{_escape(username)}</USERNAME>")
-    if currency is not None:
-        lines.append(f"  <CURRENCY>{_escape(currency)}</CURRENCY>")
-    if balance_cents is not None:
-        lines.append(f"  <BALANCE>{balance_cents}</BALANCE>")
-    lines.append("</RESPONSE>")
+    # Mode 1: embed custom inner
+    if inner is not None:
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            "<EXTSYSTEM>\n"
+            f"{req}\n"
+            f"  <TIME>{time}</TIME>\n"
+            "  <RESPONSE>\n"
+            f"{inner}\n"
+            "  </RESPONSE>\n"
+            "</EXTSYSTEM>"
+        )
 
-    resp = "\n".join(lines)
-    return _wrap_extsystem(req, resp)
+    # Mode 2: full account/auth shape
+    if user_id is not None and username is not None and currency is not None and balance_cents is not None:
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            "<EXTSYSTEM>\n"
+            f"{req}\n"
+            f"  <TIME>{time}</TIME>\n"
+            "  <RESPONSE>\n"
+            "    <RESULT>OK</RESULT>\n"
+            f"    <USERID>{user_id}</USERID>\n"
+            f"    <USERNAME>{escape(username)}</USERNAME>\n"
+            f"    <CURRENCY>{escape(currency)}</CURRENCY>\n"
+            f"    <BALANCE>{int(balance_cents)}</BALANCE>\n"
+            "  </RESPONSE>\n"
+            "</EXTSYSTEM>"
+        )
 
+    # Mode 3: balance-only
+    if balance_cents is not None and user_id is None and username is None and currency is None:
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            "<EXTSYSTEM>\n"
+            f"{req}\n"
+            f"  <TIME>{time}</TIME>\n"
+            "  <RESPONSE>\n"
+            "    <RESULT>OK</RESULT>\n"
+            f"    <BALANCE>{int(balance_cents)}</BALANCE>\n"
+            "  </RESPONSE>\n"
+            "</EXTSYSTEM>"
+        )
 
-# Back-compat convenience (if some legacy code still calls this):
-def render_auth_response(**kwargs) -> str:  # pragma: no cover
-    return envelope_ok(**kwargs)
+    # Mode 4: plain OK
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        "<EXTSYSTEM>\n"
+        f"{req}\n"
+        f"  <TIME>{time}</TIME>\n"
+        "  <RESPONSE>\n"
+        "    <RESULT>OK</RESULT>\n"
+        "  </RESPONSE>\n"
+        "</EXTSYSTEM>"
+    )
 
-
-# ---------------------------------------------------------------------------
-# Endpoint-specific OK envelopes
-# ---------------------------------------------------------------------------
 
 def envelope_bet_ok(
     *,
-    request_fields: Dict[str, str],
-    extsystem_transaction_id: str,
-    balance_cents: int,
+    ext_system_transaction_id: str | None = None,
+    balance_cents: int | None = None,
+    request_fields: Any = None,
+    **kwargs,
 ) -> str:
     """
-    Bet response expected by BSG:
-      <RESPONSE>
-        <RESULT>OK</RESULT>
-        <EXTSYSTEMTRANSACTIONID>...</EXTSYSTEMTRANSACTIONID>
-        <BALANCE>...</BALANCE>
-      </RESPONSE>
+    Bet result OK.
+    Back-compat: also accepts 'extsystem_transaction_id' via **kwargs.
     """
+    if ext_system_transaction_id is None and "extsystem_transaction_id" in kwargs:
+        ext_system_transaction_id = kwargs["extsystem_transaction_id"]
+
+    if ext_system_transaction_id is None:
+        raise TypeError("ext_system_transaction_id is required")
+
+    if balance_cents is None:
+        raise TypeError("balance_cents is required")
+
     req = _render_request_fields(request_fields)
-    resp = (
-        "<RESPONSE>\n"
-        "  <RESULT>OK</RESULT>\n"
-        f"  <EXTSYSTEMTRANSACTIONID>{_escape(extsystem_transaction_id)}</EXTSYSTEMTRANSACTIONID>\n"
-        f"  <BALANCE>{balance_cents}</BALANCE>\n"
-        "</RESPONSE>"
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        "<EXTSYSTEM>\n"
+        f"{req}\n"
+        f"  <TIME>{_now_str()}</TIME>\n"
+        "  <RESPONSE>\n"
+        "    <RESULT>OK</RESULT>\n"
+        f"    <EXTSYSTEMTRANSACTIONID>{escape(str(ext_system_transaction_id))}</EXTSYSTEMTRANSACTIONID>\n"
+        f"    <BALANCE>{int(balance_cents)}</BALANCE>\n"
+        "  </RESPONSE>\n"
+        "</EXTSYSTEM>"
     )
-    return _wrap_extsystem(req, resp)
 
 
 def envelope_refund_ok(
     *,
-    request_fields: Dict[str, str],
-    extsystem_transaction_id: str,
+    ext_system_transaction_id: str | None = None,
+    request_fields: Any = None,
+    **kwargs,
 ) -> str:
     """
-    Refund response expected by BSG:
-      <RESPONSE>
-        <RESULT>OK</RESULT>
-        <EXTSYSTEMTRANSACTIONID>...</EXTSYSTEMTRANSACTIONID>
-      </RESPONSE>
+    Refund OK.
+    Back-compat: also accepts 'extsystem_transaction_id' via **kwargs.
     """
+    if ext_system_transaction_id is None and "extsystem_transaction_id" in kwargs:
+        ext_system_transaction_id = kwargs["extsystem_transaction_id"]
+
+    if ext_system_transaction_id is None:
+        raise TypeError("ext_system_transaction_id is required")
+
     req = _render_request_fields(request_fields)
-    resp = (
-        "<RESPONSE>\n"
-        "  <RESULT>OK</RESULT>\n"
-        f"  <EXTSYSTEMTRANSACTIONID>{_escape(extsystem_transaction_id)}</EXTSYSTEMTRANSACTIONID>\n"
-        "</RESPONSE>"
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        "<EXTSYSTEM>\n"
+        f"{req}\n"
+        f"  <TIME>{_now_str()}</TIME>\n"
+        "  <RESPONSE>\n"
+        "    <RESULT>OK</RESULT>\n"
+        f"    <EXTSYSTEMTRANSACTIONID>{escape(str(ext_system_transaction_id))}</EXTSYSTEMTRANSACTIONID>\n"
+        "  </RESPONSE>\n"
+        "</EXTSYSTEM>"
     )
-    return _wrap_extsystem(req, resp)

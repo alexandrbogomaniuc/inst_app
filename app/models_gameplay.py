@@ -10,6 +10,7 @@ from sqlalchemy import (
     text,
     UniqueConstraint,
     Index,
+    Enum as SAEnum,
 )
 from sqlalchemy.orm import relationship
 
@@ -21,31 +22,45 @@ class GameplayTransaction(Base):
     __tablename__ = "gameplay_transactions"
 
     transaction_id = Column(Integer, primary_key=True, autoincrement=True)
-    userId = Column(Integer, ForeignKey("players.userId"), nullable=False)
-    wallet_id = Column(Integer, ForeignKey("wallets.wallet_id"), nullable=False)
 
-    # optional, matches your schema
-    bank_id = Column(Integer, nullable=True)
+    userId = Column(Integer, ForeignKey("players.userId"), nullable=False, index=True)
+    wallet_id = Column(Integer, ForeignKey("wallets.wallet_id"), nullable=False, index=True)
+    bank_id = Column(Integer, nullable=True, index=True)
 
-    transaction_type = Column(String(10), nullable=False)  # 'bet','win','refund'
-    amount = Column(Numeric(15, 2), server_default=text("0.00"))
-    status = Column(String(9), nullable=False, server_default=text("'Pending'"))  # Pending/Processed/Failed
-    transaction_date = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"))
+    # 'bet' | 'win' | 'refund'
+    transaction_type = Column(String(10), nullable=False)
+
+    amount = Column(Numeric(15, 2), nullable=False, server_default="0.00")
+
+    status = Column(
+        SAEnum("Pending", "Processed", "Failed", name="gameplay_status"),
+        nullable=False,
+        server_default="Pending",
+    )
+
+    transaction_date = Column(TIMESTAMP, nullable=True, server_default=text("CURRENT_TIMESTAMP"))
     description = Column(String(255), nullable=True)
 
-    external_transaction_id = Column(String(255), nullable=True)
+    external_transaction_id = Column(String(255), nullable=True, index=True)
     external_gamesession_id = Column(String(255), nullable=True)
-    external_gameround_id = Column(String(255), nullable=True)
-    external_game_id = Column(String(255), nullable=True)
+    external_gameround_id = Column(String(255), nullable=True, index=True)
+    external_game_id = Column(String(255), nullable=True, index=True)
+
     ISROUNDFINISHED = Column(String(255), nullable=True)
 
-    # relationships (optional)
-    player = relationship("Player", backref="gameplay_transactions")
-    wallet = relationship("Wallet", backref="gameplay_transactions")
+    # relationships (optional, but handy)
+    wallet = relationship("Wallet")
+    player = relationship("Player")
 
     __table_args__ = (
-        UniqueConstraint("userId", "bank_id", "transaction_type", "external_transaction_id", name="uq_gameplay_ext"),
         Index("ix_gameplay_user", "userId"),
         Index("ix_gameplay_round", "external_gameround_id"),
         Index("ix_gameplay_game", "external_game_id"),
+        UniqueConstraint(
+            "userId",
+            "bank_id",
+            "transaction_type",
+            "external_transaction_id",
+            name="uq_gameplay_ext",
+        ),
     )

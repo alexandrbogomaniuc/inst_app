@@ -1,216 +1,249 @@
 from __future__ import annotations
 
-import hashlib
-from decimal import Decimal
-from typing import Optional
+from decimal import Decimal, ROUND_DOWN
+from typing import Optional, Tuple, List
 from urllib.parse import unquote_plus
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from igw.app.db import get_db
 from igw.app.models import Wallet
-from igw.app.models_gameplay import GameplayTransaction  # NEW: small dedicated model
-from igw.app.utils.security import decode_token
+from igw.app.models_gameplay import GameplayTransaction
 from ..settings import get_bank_settings, resolve_bank_id
-from ..helpers import media_response, wallet_cents
+from ..helpers import md5_hex, wallet_cents
 from ..xml.utils import envelope_fail, envelope_bet_ok
 
 router = APIRouter()
 
+# ---------- helpers ----------
 
-def _normalize_bool_to_bsg(val: Optional[str]) -> str:
-    if val is None:
-        return ""
-    s = str(val).strip().lower()
-    if s in ("true", "false", ""):
-        return s
-    if s in ("1", "y", "yes", "t"):
-        return "true"
-    if s in ("0", "n", "no", "f"):
-        return "false"
-    return s
+def _parse_amount_and_ext(value: Optional[str]) -> Tuple[Optional[int], Optional[str]]:
+    """
+    Parse strings like "80|2629682833" into (80, "2629682833").
+    Returns (None, None) if value is None or empty.
+    """
+    if not value:
+        return None, None
+    raw = unquote_plus(value)
+    if "|" in raw:
+        left, right = raw.split("|", 1)
+        left = left.strip()
+        right = right.strip()
+        if left == "":
+            amt = 0
+        else:
+            try:
+                amt = int(left)
+            except ValueError:
+                amt = None
+        ext = right or None
+        return amt, ext
+    # fallback: amount only
+    try:
+        amt = int(raw.strip())
+    except ValueError:
+        amt = None
+    return amt, None
 
 
-def _md5_bet(
-    *,
-    user_id: int | str | None,
-    bet_raw: str | None,            # may be url-encoded like '80%7C2629'
-    win: str | None,
-    is_round_finished: str | None,  # expect 'true'/'false' or empty
-    round_id: str | None,
-    game_id: str | None,
+def _hash_for_bet_result(
+    user_id: int,
+    bet_raw: Optional[str],
+    win_raw: Optional[str],
+    is_round_finished: Optional[str],
+    round_id: Optional[str],
+    game_id: Optional[str],
     pass_key: str,
-) -> str:
-    user_s = "" if user_id is None else str(user_id)
-    # IMPORTANT: decode bet BEFORE hashing per BSG spec
-    bet_s = "" if bet_raw is None else unquote_plus(str(bet_raw))
-    win_s = "" if win is None else str(win)
-    isrf_s = _normalize_bool_to_bsg(is_round_finished)
-    round_s = "" if round_id is None else str(round_id)
-    game_s = "" if game_id is None else str(game_id)
-    concat = f"{user_s}{bet_s}{win_s}{isrf_s}{round_s}{game_s}{pass_key}"
-    digest = hashlib.md5(concat.encode("utf-8")).hexdigest()
-    print(f"[BSG/betResult] concat='{concat}' expected_md5='{digest}'")
-    return digest
+) -> Tuple[str, str]:
+    """
+    MD5(userId + bet + win + isRoundFinished + roundId + gameId + passkey)
+    - bet / win absent => empty string
+    - isRoundFinished absent => omit entirely
+    - if present, normalize to lower-case 'true'/'false'
+    """
+    bet_part = unquote_plus(bet_raw) if bet_raw else ""
+    win_part = unquote_plus(win_raw) if win_raw else ""
 
+    parts: List[str] = [str(user_id), bet_part, win_part]
+    if is_round_finished is not None:
+        parts.append(str(is_round_finished).lower())
+    parts.extend([str(round_id or ""), str(game_id or ""), pass_key])
+    concat = "".join(parts)
+    return md5_hex(concat), concat
+
+
+def _get_or_create_wallet(db: Session, user_id: int, currency_code: str) -> Wallet:
+    w: Wallet | None = (
+        db.query(Wallet)
+        .filter(Wallet.userId == user_id, Wallet.currency_code == currency_code)
+        .with_for_update(read=True)
+        .first()
+    )
+    if w:
+        return w
+    w = Wallet(userId=user_id, currency_code=currency_code, balance=Decimal("0.00"))
+    db.add(w)
+    db.flush()
+    return w
+
+
+def _apply_amount_to_wallet(w: Wallet, cents: int, *, op: str) -> None:
+    """
+    op='debit' => subtract; op='credit' => add. cents are integer minor units.
+    """
+    delta = (Decimal(cents) / Decimal(100)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    if op == "debit":
+        w.balance = (Decimal(w.balance or 0) - delta).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    else:
+        w.balance = (Decimal(w.balance or 0) + delta).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+
+# ---------- endpoint ----------
 
 @router.get("/betResult")
 async def bet_result(
     request: Request,
-    bankId: int | None = Query(None),
-    userId: int | None = Query(None),
-    bet: str | None = Query(None),            # "80|2629..." (URL-encoded in query)
-    win: str | None = Query(None),            # may be omitted -> '' for hash
-    isRoundFinished: str | None = Query(None),
-    roundId: str | None = Query(None),
-    gameId: str | None = Query(None),
-    gameSessionId: str | None = Query(None),
-    clientType: str | None = Query(None),
-    hash: str | None = Query(None),
-    token: str | None = Query(None),
+    bankId: int = Query(...),
+    userId: int = Query(...),
+    gameId: str = Query(...),
+    roundId: str = Query(...),
+    hash: str = Query(...),
+    token: Optional[str] = Query(None),         # echoed only
+    bet: Optional[str] = Query(None),
+    win: Optional[str] = Query(None),
+    isRoundFinished: Optional[str] = Query(None),
+    gameSessionId: Optional[str] = Query(None),
+    clientType: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
     """
-    BSG bet result:
-
-    Hash must be:
-      MD5(userId + bet + win + isRoundFinished + roundId + gameId + passkey)
-      where 'bet' is URL-decoded *before* hashing (e.g. '80%7C123' -> '80|123').
-      'win' may be absent -> treated as '' for hashing.
-
-    On new bet: create 'Pending' tx, deduct wallet, set 'Processed', return:
-      <RESULT>OK</RESULT>
-      <EXTSYSTEMTRANSACTIONID>{external_tx_id}</EXTSYSTEMTRANSACTIONID>
-      <BALANCE>{balance_in_cents}</BALANCE>
-
-    Idempotency: if an identical external tx (type 'bet'/'win') is already Processed,
-    do NOT change balance again; return OK with current balance.
+    Accepts bet-only, win-only, or both.
+    Updates wallet: bet -> debit, win -> credit.
+    Idempotent by (userId, bank_id, transaction_type, external_transaction_id).
+    Responds with EXTSYSTEM XML including EXTSYSTEMTRANSACTIONID and BALANCE.
     """
     resolved_bank_id = resolve_bank_id(bankId)
     bank = get_bank_settings(resolved_bank_id)
-    protocol = (bank.BSG_PROTOCOL or "xml").lower()
 
-    if protocol != "xml":
-        return media_response({"result": "failed", "code": 415, "reason": "xml-only bank"}, "json")
+    # Echo the request in the expected order
+    req_fields = [
+        ("USERID", userId),
+        ("BET", unquote_plus(bet) if bet else ""),
+        ("WIN", unquote_plus(win) if win else ""),
+        ("ISROUNDFINISHED", str(isRoundFinished).lower() if isRoundFinished is not None else ""),
+        ("ROUNDID", roundId),
+        ("GAMEID", gameId),
+        ("HASH", hash),
+        ("GAMESESSIONID", gameSessionId or ""),
+        ("CLIENTTYPE", clientType or ""),
+    ]
 
-    # REQUEST echo (what BSG wants to see back)
-    bet_decoded = unquote_plus(bet) if bet is not None else ""
-    req_fields = {
-        "USERID": str(userId) if userId is not None else "",
-        "BET": bet_decoded,
-        "WIN": "" if win is None else str(win),
-        "ISROUNDFINISHED": isRoundFinished or "",
-        "ROUNDID": roundId or "",
-        "GAMEID": gameId or "",
-        "HASH": hash or "",
-        "GAMESESSIONID": gameSessionId or "",
-        "CLIENTTYPE": clientType or "",
-    }
-
-    # Basic required params
-    if userId is None or bet is None or roundId is None or gameId is None or not hash:
-        xml = envelope_fail(400, "missing required params", request_fields=req_fields)
+    # At least one of bet/win must be present
+    if not bet and not win:
+        xml = envelope_fail(400, "missing parameters: bet and/or win", request_fields=req_fields)
         return Response(content=xml, media_type="application/xml")
 
-    # Verify hash
-    expected = _md5_bet(
+    # Validate hash
+    expected_md5, _concat = _hash_for_bet_result(
         user_id=userId,
-        bet_raw=bet,  # keep encoded; helper will unquote internally
-        win=win,
+        bet_raw=bet or "",
+        win_raw=win or "",
         is_round_finished=isRoundFinished,
         round_id=roundId,
         game_id=gameId,
         pass_key=bank.BSG_PASS_KEY,
     )
-    if expected.lower() != (hash or "").lower():
+    if expected_md5.lower() != hash.lower():
         xml = envelope_fail(401, "invalid hash", request_fields=req_fields)
         return Response(content=xml, media_type="application/xml")
 
-    # Extract "cents|ext_tx_id" from decoded bet
-    try:
-        bet_cents_str, ext_tx_id = bet_decoded.split("|", 1)
-    except ValueError:
-        xml = envelope_fail(400, "malformed bet", request_fields=req_fields)
-        return Response(content=xml, media_type="application/xml")
+    # Parse bet and win (amount in cents + external id)
+    bet_cents, bet_ext = _parse_amount_and_ext(bet)
+    win_cents, win_ext = _parse_amount_and_ext(win)
 
-    try:
-        bet_cents = int(bet_cents_str)
-    except ValueError:
-        xml = envelope_fail(400, "invalid bet amount", request_fields=req_fields)
-        return Response(content=xml, media_type="application/xml")
-
-    # Idempotency: already processed?
-    existing = (
-        db.query(GameplayTransaction)
-        .filter(
-            GameplayTransaction.userId == userId,
-            GameplayTransaction.bank_id == resolved_bank_id,
-            GameplayTransaction.transaction_type.in_(["bet", "win"]),
-            GameplayTransaction.external_transaction_id == ext_tx_id,
-        )
-        .first()
-    )
-    if existing and existing.status == "Processed":
-        currency = bank.BSG_DEFAULT_CURRENCY or "USD"
-        bal_cents = wallet_cents(db, userId, currency)
-        xml = envelope_bet_ok(
-            ext_system_transaction_id=ext_tx_id,
-            balance_cents=bal_cents,
-            request_fields=req_fields,
-        )
-        return Response(content=xml, media_type="application/xml")
-
-    # Load/create wallet
+    # Open / create wallet (bank default currency)
     currency = bank.BSG_DEFAULT_CURRENCY or "USD"
-    wallet: Wallet | None = (
-        db.query(Wallet)
-        .filter(Wallet.userId == userId, Wallet.currency_code == currency)
-        .first()
-    )
-    if not wallet:
-        wallet = Wallet(userId=userId, currency_code=currency, balance=Decimal("0.00"))
-        db.add(wallet)
-        db.flush()
+    w = _get_or_create_wallet(db, userId, currency)
 
-    # Create pending tx
-    tx = GameplayTransaction(
-        userId=userId,
-        wallet_id=wallet.wallet_id,
-        bank_id=resolved_bank_id,
-        transaction_type="bet",
-        amount=Decimal(bet_cents) / Decimal(100),
-        status="Pending",
-        description=None,
-        external_transaction_id=ext_tx_id,
-        external_gamesession_id=gameSessionId or None,
-        external_gameround_id=roundId or None,
-        external_game_id=str(gameId) if gameId is not None else None,
-        ISROUNDFINISHED=isRoundFinished or None,
-    )
-    db.add(tx)
-    db.flush()
+    # Process bet (debit) if present and not already processed
+    if bet_ext is not None and bet_cents is not None:
+        try:
+            tx = GameplayTransaction(
+                userId=userId,
+                wallet_id=w.wallet_id,
+                bank_id=resolved_bank_id,
+                transaction_type="bet",
+                amount=Decimal(bet_cents) / Decimal(100),
+                status="Pending",
+                description=None,
+                external_transaction_id=str(bet_ext),
+                external_gamesession_id=str(gameSessionId or ""),
+                external_gameround_id=str(roundId or ""),
+                external_game_id=str(gameId or ""),
+                ISROUNDFINISHED=str(isRoundFinished).lower() if isRoundFinished is not None else None,
+            )
+            db.add(tx)
+            _apply_amount_to_wallet(w, bet_cents, op="debit")
+            tx.status = "Processed"
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            # Already processed bet => no double-debit
+        except Exception:
+            db.rollback()
+            xml = envelope_fail(500, "internal error applying bet", request_fields=req_fields)
+            return Response(content=xml, media_type="application/xml")
 
-    # Deduct and finalize
+    # Process win (credit) if present and not already processed
+    if win_ext is not None and win_cents is not None:
+        try:
+            tx = GameplayTransaction(
+                userId=userId,
+                wallet_id=w.wallet_id,
+                bank_id=resolved_bank_id,
+                transaction_type="win",
+                amount=Decimal(win_cents) / Decimal(100),
+                status="Pending",
+                description=None,
+                external_transaction_id=str(win_ext),
+                external_gamesession_id=str(gameSessionId or ""),
+                external_gameround_id=str(roundId or ""),
+                external_game_id=str(gameId or ""),
+                ISROUNDFINISHED=str(isRoundFinished).lower() if isRoundFinished is not None else None,
+            )
+            db.add(tx)
+            if win_cents and win_cents > 0:
+                _apply_amount_to_wallet(w, win_cents, op="credit")
+            tx.status = "Processed"
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            # Already processed win => no double-credit
+        except Exception:
+            db.rollback()
+            xml = envelope_fail(500, "internal error applying win", request_fields=req_fields)
+            return Response(content=xml, media_type="application/xml")
+
+    # Commit
     try:
-        wallet.balance = (wallet.balance or Decimal("0.00")) - (Decimal(bet_cents) / Decimal(100))
-        db.flush()
-        tx.status = "Processed"
         db.commit()
-    except Exception as e:
+    except Exception:
         db.rollback()
-        tx.status = "Failed"
-        db.add(tx)
-        db.commit()
-        xml = envelope_fail(500, f"wallet update failed: {e}", request_fields=req_fields)
+        xml = envelope_fail(500, "internal error committing", request_fields=req_fields)
         return Response(content=xml, media_type="application/xml")
 
-    # OK with new balance (cents) + external tx id
-    bal_cents = wallet_cents(db, userId, currency)
+    # Balance in cents for response
+    balance_after_cents = wallet_cents(db, userId, currency)
+
+    # Choose external id to echo back: prefer WIN if present, else BET
+    ext_id = win_ext or bet_ext or ""
+
     xml = envelope_bet_ok(
-        ext_system_transaction_id=ext_tx_id,
-        balance_cents=bal_cents,
+        ext_system_transaction_id=str(ext_id),
+        balance_cents=balance_after_cents,
         request_fields=req_fields,
     )
     return Response(content=xml, media_type="application/xml")
