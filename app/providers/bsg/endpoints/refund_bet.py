@@ -1,20 +1,19 @@
 from __future__ import annotations
 
+import hashlib
 from decimal import Decimal
-from typing import Optional
+from urllib.parse import unquote_plus
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import Response
-from sqlalchemy import select, and_
 from sqlalchemy.orm import Session
 
 from igw.app.db import get_db
 from igw.app.models import Wallet
 from igw.app.models_gameplay import GameplayTransaction
-
 from ..settings import get_bank_settings, resolve_bank_id
-from ..xml.utils import envelope_ok, envelope_fail
-from ..helpers import md5_hex
+from ..helpers import media_response
+from ..xml.utils import envelope_fail, envelope_refund_ok  # assumes you have this
 
 router = APIRouter()
 
@@ -23,153 +22,104 @@ router = APIRouter()
 async def refund_bet(
     request: Request,
     bankId: int | None = Query(None),
-    userId: int = Query(...),
-    casinoTransactionId: str = Query(...),
-    hash: str = Query(...),
-    token: Optional[str] = Query(None),  # not part of hash
+    userId: int | None = Query(None),
+    casinoTransactionId: str | None = Query(None),
+    hash: str | None = Query(None),
+    token: str | None = Query(None),
     db: Session = Depends(get_db),
 ):
-    """
-    Refund hash formula:
-      MD5(userId + casinoTransactionId + passkey)
-
-    Response format (XML):
-    <EXTSYSTEM>
-      <REQUEST>
-        <USERID>...</USERID>
-        <CASINOTRANSACTIONID>...</CASINOTRANSACTIONID>
-        <HASH>...</HASH>
-      </REQUEST>
-      <TIME>...</TIME>
-      <RESPONSE>
-        <RESULT>OK</RESULT>
-        <EXTSYSTEMTRANSACTIONID>...</EXTSYSTEMTRANSACTIONID>
-      </RESPONSE>
-    </EXTSYSTEM>
-    """
     resolved_bank_id = resolve_bank_id(bankId)
     bank = get_bank_settings(resolved_bank_id)
+    protocol = (bank.BSG_PROTOCOL or "xml").lower()
 
-    # Build REQUEST echo (order per provider example)
+    if protocol != "xml":
+        return media_response({"result": "failed", "code": 415, "reason": "xml-only bank"}, "json")
+
     req_fields = {
         "USERID": str(userId) if userId is not None else "",
-        "CASINOTRANSACTIONID": str(casinoTransactionId) if casinoTransactionId is not None else "",
+        "CASINOTRANSACTIONID": casinoTransactionId or "",
         "HASH": hash or "",
     }
 
-    # Validate hash
-    expected = md5_hex(f"{userId}{casinoTransactionId}{bank.BSG_PASS_KEY}")
-    print(f"[BSG/refundBet] concat='{userId}{casinoTransactionId}{bank.BSG_PASS_KEY}' "
-          f"expected_md5='{expected}' provided='{hash}'")
+    if userId is None or not casinoTransactionId or not hash:
+        xml = envelope_fail(400, "missing required params", request_fields=req_fields)
+        return Response(content=xml, media_type="application/xml")
+
+    # Hash = MD5(userId + casinoTransactionId + passkey)
+    concat = f"{userId}{casinoTransactionId}{bank.BSG_PASS_KEY}"
+    expected = hashlib.md5(concat.encode("utf-8")).hexdigest()
+    print(f"[BSG/refundBet] concat='{concat}' expected_md5='{expected}' provided='{hash}'")
     if expected.lower() != hash.lower():
         xml = envelope_fail(401, "invalid hash", request_fields=req_fields)
         return Response(content=xml, media_type="application/xml")
 
-    # Find original BET transaction for this casinoTransactionId (idempotency anchor)
-    orig_bet_row = db.execute(
-        select(GameplayTransaction)
-        .where(
-            and_(
-                GameplayTransaction.userId == userId,
-                GameplayTransaction.external_transaction_id == str(casinoTransactionId),
-                GameplayTransaction.transaction_type == "bet",
-                # bank_id might be newly added; guard if column missing
-                *( [GameplayTransaction.bank_id == resolved_bank_id]
-                   if hasattr(GameplayTransaction, "bank_id") else [] )
-            )
+    # Find original tx (bet/win)
+    original = (
+        db.query(GameplayTransaction)
+        .filter(
+            GameplayTransaction.userId == userId,
+            GameplayTransaction.bank_id == resolved_bank_id,
+            GameplayTransaction.external_transaction_id == casinoTransactionId,
+            GameplayTransaction.transaction_type.in_(["bet", "win"]),
+            GameplayTransaction.status == "Processed",
         )
-        .limit(1)
-    ).scalar_one_or_none()
-
-    if not orig_bet_row:
-        # Per your requirement: send FAILED with <CODE>302</CODE> if original tx not found
+        .first()
+    )
+    if not original:
         xml = envelope_fail(302, "ORIGINAL_TRANSACTION_NOT_FOUND", request_fields=req_fields)
         return Response(content=xml, media_type="application/xml")
 
-    # If refund already processed for this bet, return OK with same internal tx id (idempotency)
-    existing_refund = db.execute(
-        select(GameplayTransaction.transaction_id, GameplayTransaction.status)
-        .where(
-            and_(
-                GameplayTransaction.userId == userId,
-                GameplayTransaction.external_transaction_id == str(casinoTransactionId),
-                GameplayTransaction.transaction_type == "refund",
-                *( [GameplayTransaction.bank_id == resolved_bank_id]
-                   if hasattr(GameplayTransaction, "bank_id") else [] )
-            )
+    # Idempotency for refund
+    already = (
+        db.query(GameplayTransaction)
+        .filter(
+            GameplayTransaction.userId == userId,
+            GameplayTransaction.bank_id == resolved_bank_id,
+            GameplayTransaction.transaction_type == "refund",
+            GameplayTransaction.external_transaction_id == casinoTransactionId,
+            GameplayTransaction.status == "Processed",
         )
-        .order_by(GameplayTransaction.transaction_id.desc())
-    ).first()
-
-    if existing_refund and (existing_refund[1] or "").lower() == "processed":
-        response_inner = (
-            f"<RESULT>OK</RESULT>"
-            f"<EXTSYSTEMTRANSACTIONID>{existing_refund[0]}</EXTSYSTEMTRANSACTIONID>"
-        )
-        xml = envelope_ok(response_inner_xml=response_inner, request_fields=req_fields)
-        return Response(content=xml, media_type="application/xml")
-
-    # We must credit back the original bet amount to the user's wallet (in currency units).
-    amount = Decimal(orig_bet_row.amount or 0).quantize(Decimal("0.01"))
-    currency = bank.BSG_DEFAULT_CURRENCY or "USD"
-
-    wallet: Wallet | None = (
-        db.query(Wallet)
-        .filter(Wallet.userId == userId, Wallet.currency_code == currency)
-        .with_for_update()
         .first()
     )
-    if not wallet:
-        xml = envelope_fail(404, "USER_WALLET_NOT_FOUND", request_fields=req_fields)
+    if already:
+        xml = envelope_refund_ok(ext_system_transaction_id=str(already.transaction_id), request_fields=req_fields)
         return Response(content=xml, media_type="application/xml")
 
-    # Insert refund tx with Pending
+    # Credit back the original amount
+    wallet = db.query(Wallet).filter(Wallet.wallet_id == original.wallet_id).first()
+    if not wallet:
+        xml = envelope_fail(500, "wallet not found", request_fields=req_fields)
+        return Response(content=xml, media_type="application/xml")
+
     refund_tx = GameplayTransaction(
         userId=userId,
-        wallet_id=int(getattr(wallet, wallet.__mapper__.primary_key[0].key)),
+        wallet_id=original.wallet_id,
+        bank_id=resolved_bank_id,
         transaction_type="refund",
-        amount=amount,  # credit
-        description=f"Refund of casinoTx={casinoTransactionId}",
-        external_transaction_id=str(casinoTransactionId),
-        external_gamesession_id=None,
-        external_gameround_id=orig_bet_row.external_gameround_id,
-        external_game_id=orig_bet_row.external_game_id,
+        amount=original.amount,  # add back what was deducted
+        status="Pending",
+        description=f"Refund of {casinoTransactionId}",
+        external_transaction_id=casinoTransactionId,
+        external_gamesession_id=original.external_gamesession_id,
+        external_gameround_id=original.external_gameround_id,
+        external_game_id=original.external_game_id,
         ISROUNDFINISHED=None,
-        # status/bank_id fields may not exist on older schema; set if present
-        **({"status": "Pending"} if hasattr(GameplayTransaction, "status") else {}),
-        **({"bank_id": resolved_bank_id} if hasattr(GameplayTransaction, "bank_id") else {}),
     )
     db.add(refund_tx)
-    db.flush()  # get refund_tx.transaction_id
+    db.flush()
 
     try:
-        # Credit wallet
-        wallet.balance = (Decimal(wallet.balance or 0) + amount).quantize(Decimal("0.01"))
-
-        # Mark processed
-        if hasattr(refund_tx, "status"):
-            refund_tx.status = "Processed"
-
+        wallet.balance = (wallet.balance or Decimal("0.00")) + (original.amount or Decimal("0.00"))
+        db.flush()
+        refund_tx.status = "Processed"
         db.commit()
-
     except Exception as e:
         db.rollback()
-        # Mark failed (best-effort) and persist
-        try:
-            if hasattr(refund_tx, "status"):
-                refund_tx.status = "Failed"
-            db.add(refund_tx)
-            db.commit()
-        except Exception:
-            db.rollback()
-
-        xml = envelope_fail(500, f"REFUND_FAILED {e}", request_fields=req_fields)
+        refund_tx.status = "Failed"
+        db.add(refund_tx)
+        db.commit()
+        xml = envelope_fail(500, f"refund failed: {e}", request_fields=req_fields)
         return Response(content=xml, media_type="application/xml")
 
-    # Success
-    response_inner = (
-        f"<RESULT>OK</RESULT>"
-        f"<EXTSYSTEMTRANSACTIONID>{refund_tx.transaction_id}</EXTSYSTEMTRANSACTIONID>"
-    )
-    xml = envelope_ok(response_inner_xml=response_inner, request_fields=req_fields)
+    xml = envelope_refund_ok(ext_system_transaction_id=str(refund_tx.transaction_id), request_fields=req_fields)
     return Response(content=xml, media_type="application/xml")

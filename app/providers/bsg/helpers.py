@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from decimal import Decimal
-from typing import Dict, Optional, Any, Union
+from typing import Dict, Optional, Any
 from urllib.parse import unquote_plus
 
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -10,8 +10,6 @@ from sqlalchemy.orm import Session
 
 from igw.app.models import Wallet
 
-
-# ------------------------------- Core utils (kept) -------------------------------
 
 def md5_hex(s: str) -> str:
     return hashlib.md5(s.encode("utf-8")).hexdigest()
@@ -73,69 +71,66 @@ def wallet_cents(db: Session, uid: int, currency_code: str) -> int:
     return int(Decimal(w.balance) * 100)
 
 
-# ------------------------------- New helpers for BSG hashes -------------------------------
+# -------------------- BSG-specific helpers --------------------
 
-def _concat_parts(*parts: Optional[Union[str, int, bool]]) -> str:
+def _normalize_bool_to_bsg(val: Any) -> str:
     """
-    Concatenate parts as strings in order.
-    None -> "" (empty). Booleans -> 'true' / 'false'.
+    BSG expects 'true' / 'false' strings for isRoundFinished.
+    If missing/None -> '' (empty string).
     """
-    out: list[str] = []
-    for p in parts:
-        if p is None:
-            out.append("")
-        elif isinstance(p, bool):
-            out.append("true" if p else "false")
-        else:
-            out.append(str(p))
-    return "".join(out)
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        s = val.strip().lower()
+        if s in ("true", "false", ""):
+            return s
+        # allow "0"/"1"/"yes"/"no" etc. -> coerce to true/false
+        if s in ("1", "y", "yes", "t"):
+            return "true"
+        if s in ("0", "n", "no", "f"):
+            return "false"
+        return s
+    return "true" if bool(val) else "false"
 
 
-def decode_bet_param(bet_raw: str) -> str:
+def md5_hex_bet(*args, **kwargs) -> str:
     """
-    BSG sends 'bet' URL-encoded (e.g. '80%7C2629682818'). We must hash the
-    *decoded* value ('80|2629682818').
+    Compute betresult hash:
+
+      MD5(userId + bet + win + isRoundFinished + roundId + gameId + passkey)
+
+    Accepts either positional:
+        (user_id, bet, win, is_round_finished, round_id, game_id, pass_key)
+    or keyword (snake_case and camelCase):
+        user_id/userId, bet/bet_str, win,
+        is_round_finished/isRoundFinished, round_id/roundId,
+        game_id/gameId, pass_key
+
+    Notes:
+      - 'bet' is URL-decoded before hashing (e.g., '80%7C123' -> '80|123')
+      - If win missing -> '' (empty string)
+      - isRoundFinished normalized to 'true'/'false' (or '' if missing)
     """
-    return unquote_plus(bet_raw)
+    if args and not kwargs:
+        user_id, bet, win, is_round_finished, round_id, game_id, pass_key = args
+    else:
+        user_id = kwargs.get("user_id", kwargs.get("userId"))
+        bet = kwargs.get("bet", kwargs.get("bet_str"))
+        win = kwargs.get("win", "")
+        is_round_finished = kwargs.get("is_round_finished", kwargs.get("isRoundFinished"))
+        round_id = kwargs.get("round_id", kwargs.get("roundId"))
+        game_id = kwargs.get("game_id", kwargs.get("gameId"))
+        pass_key = kwargs.get("pass_key")
 
+    user_id = "" if user_id is None else str(user_id)
+    bet = "" if bet is None else unquote_plus(str(bet))             # <-- decode before hashing
+    win = "" if win is None else str(win)
+    is_round_finished = _normalize_bool_to_bsg(is_round_finished)
+    round_id = "" if round_id is None else str(round_id)
+    game_id = "" if game_id is None else str(game_id)
+    pass_key = "" if pass_key is None else str(pass_key)
 
-def md5_hex_refund(user_id: Union[int, str], casino_transaction_id: Union[int, str], pass_key: str) -> str:
-    """
-    refund: MD5(userId + casinoTransactionId + passkey)
-    """
-    return md5_hex(_concat_parts(user_id, casino_transaction_id, pass_key))
-
-
-def md5_hex_bet(
-    user_id: Union[int, str],
-    bet_decoded: str,
-    win: Optional[Union[int, str]],
-    is_round_finished: Optional[Union[bool, str]],
-    round_id: Union[int, str],
-    game_id: Union[int, str],
-    pass_key: str,
-) -> str:
-    """
-    betResult: MD5(userId + bet + win + isRoundFinished + roundId + gameId + passkey)
-
-    - `bet_decoded` MUST be the decoded string ('80|2629682818').
-    - `win` is optional; pass None if absent.
-    - `is_round_finished` may be bool or 'true'/'false' string; both are handled.
-    """
-    return md5_hex(_concat_parts(user_id, bet_decoded, win, is_round_finished, round_id, game_id, pass_key))
-
-
-__all__ = [
-    # existing
-    "md5_hex",
-    "media_response",
-    "hash_ok_token",
-    "hash_ok_user",
-    "echo_fields",
-    "echo_user_fields",
-    "wallet_cents",
-    # new
-    "decode_bet_param",
-    "md5_hex_refund",
-    "md5_hex_bet",
-]
+    concat = f"{user_id}{bet}{win}{is_round_finished}{round_id}{game_id}{pass_key}"
+    digest = md5_hex(concat)
+    print(f"[BSG/betResult] concat='{concat}' expected_md5='{digest}'")
+    return digest
