@@ -95,10 +95,11 @@ def _apply_amount_to_wallet(w: Wallet, cents: int, *, op: str) -> None:
     op='debit' => subtract; op='credit' => add. cents are integer minor units.
     """
     delta = (Decimal(cents) / Decimal(100)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    current = Decimal(w.balance or 0).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
     if op == "debit":
-        w.balance = (Decimal(w.balance or 0) - delta).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        w.balance = (current - delta).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
     else:
-        w.balance = (Decimal(w.balance or 0) + delta).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        w.balance = (current + delta).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
 
 # ---------- endpoint ----------
@@ -117,18 +118,22 @@ async def bet_result(
     isRoundFinished: Optional[str] = Query(None),
     gameSessionId: Optional[str] = Query(None),
     clientType: Optional[str] = Query(None),
+    negativeBet: Optional[str] = Query(None),   # NEW: credits back prior bets (cents, not in hash)
     db: Session = Depends(get_db),
 ):
     """
     Accepts bet-only, win-only, or both.
-    Updates wallet: bet -> debit, win -> credit.
+    Updates wallet: bet -> debit, win -> credit, negativeBet -> credit (comes only with WIN).
     Idempotent by (userId, bank_id, transaction_type, external_transaction_id).
-    Responds with EXTSYSTEM XML including EXTSYSTEMTRANSACTIONID and BALANCE.
+
+    Over-bet protection:
+      - If bet amount (cents) > current wallet cents, do NOT debit and return FAILED code=300.
+      - We also record a transaction row with status='Failed'.
     """
     resolved_bank_id = resolve_bank_id(bankId)
     bank = get_bank_settings(resolved_bank_id)
 
-    # Echo the request in the expected order
+    # Echo the request in the expected order (+ NEGATIVEBET)
     req_fields = [
         ("USERID", userId),
         ("BET", unquote_plus(bet) if bet else ""),
@@ -138,6 +143,7 @@ async def bet_result(
         ("GAMEID", gameId),
         ("HASH", hash),
         ("GAMESESSIONID", gameSessionId or ""),
+        ("NEGATIVEBET", str(negativeBet or "")),
         ("CLIENTTYPE", clientType or ""),
     ]
 
@@ -146,7 +152,7 @@ async def bet_result(
         xml = envelope_fail(400, "missing parameters: bet and/or win", request_fields=req_fields)
         return Response(content=xml, media_type="application/xml")
 
-    # Validate hash
+    # Validate hash (spec does not include negativeBet in the hash)
     expected_md5, _concat = _hash_for_bet_result(
         user_id=userId,
         bet_raw=bet or "",
@@ -164,70 +170,204 @@ async def bet_result(
     bet_cents, bet_ext = _parse_amount_and_ext(bet)
     win_cents, win_ext = _parse_amount_and_ext(win)
 
-    # Open / create wallet (bank default currency)
+    # Parse negativeBet (pure cents; associate with win’s transaction id)
+    neg_cents: int = 0
+    if negativeBet:
+        try:
+            neg_cents = max(0, int(str(negativeBet).strip()))
+        except ValueError:
+            neg_cents = 0  # ignore malformed negativeBet
+
     currency = bank.BSG_DEFAULT_CURRENCY or "USD"
     w = _get_or_create_wallet(db, userId, currency)
 
-    # Process bet (debit) if present and not already processed
+    # ----- Handle BET (debit) with over-bet guard -----
     if bet_ext is not None and bet_cents is not None:
-        try:
-            tx = GameplayTransaction(
-                userId=userId,
-                wallet_id=w.wallet_id,
-                bank_id=resolved_bank_id,
-                transaction_type="bet",
-                amount=Decimal(bet_cents) / Decimal(100),
-                status="Pending",
-                description=None,
-                external_transaction_id=str(bet_ext),
-                external_gamesession_id=str(gameSessionId or ""),
-                external_gameround_id=str(roundId or ""),
-                external_game_id=str(gameId or ""),
-                ISROUNDFINISHED=str(isRoundFinished).lower() if isRoundFinished is not None else None,
+        # Check idempotency for this bet ext id
+        existing_bet = (
+            db.query(GameplayTransaction)
+            .filter(
+                GameplayTransaction.userId == userId,
+                GameplayTransaction.bank_id == resolved_bank_id,
+                GameplayTransaction.transaction_type == "bet",
+                GameplayTransaction.external_transaction_id == str(bet_ext),
             )
-            db.add(tx)
-            _apply_amount_to_wallet(w, bet_cents, op="debit")
-            tx.status = "Processed"
-            db.flush()
-        except IntegrityError:
-            db.rollback()
-            # Already processed bet => no double-debit
-        except Exception:
-            db.rollback()
-            xml = envelope_fail(500, "internal error applying bet", request_fields=req_fields)
-            return Response(content=xml, media_type="application/xml")
+            .first()
+        )
+        if existing_bet:
+            if existing_bet.status == "Processed":
+                pass  # already debited
+            elif existing_bet.status == "Failed":
+                xml = envelope_fail(300, "INSUFFICIENT_FUNDS", request_fields=req_fields)
+                return Response(content=xml, media_type="application/xml")
+        else:
+            current_cents = int(Decimal(w.balance or 0) * 100)
 
-    # Process win (credit) if present and not already processed
+            if bet_cents < 0:
+                fail_tx = GameplayTransaction(
+                    userId=userId,
+                    wallet_id=w.wallet_id,
+                    bank_id=resolved_bank_id,
+                    transaction_type="bet",
+                    amount=Decimal(bet_cents) / Decimal(100),
+                    status="Failed",
+                    description="Invalid negative bet",
+                    external_transaction_id=str(bet_ext),
+                    external_gamesession_id=str(gameSessionId or ""),
+                    external_gameround_id=str(roundId or ""),
+                    external_game_id=str(gameId or ""),
+                    ISROUNDFINISHED=str(isRoundFinished).lower() if isRoundFinished is not None else None,
+                )
+                db.add(fail_tx)
+                db.commit()
+                xml = envelope_fail(400, "INVALID_BET_AMOUNT", request_fields=req_fields)
+                return Response(content=xml, media_type="application/xml")
+
+            if bet_cents > current_cents:
+                # Over-bet: record as Failed and return code 300 without changing balance
+                fail_tx = GameplayTransaction(
+                    userId=userId,
+                    wallet_id=w.wallet_id,
+                    bank_id=resolved_bank_id,
+                    transaction_type="bet",
+                    amount=Decimal(bet_cents) / Decimal(100),
+                    status="Failed",
+                    description="Insufficient funds",
+                    external_transaction_id=str(bet_ext),
+                    external_gamesession_id=str(gameSessionId or ""),
+                    external_gameround_id=str(roundId or ""),
+                    external_game_id=str(gameId or ""),
+                    ISROUNDFINISHED=str(isRoundFinished).lower() if isRoundFinished is not None else None,
+                )
+                db.add(fail_tx)
+                db.commit()
+                xml = envelope_fail(300, "INSUFFICIENT_FUNDS", request_fields=req_fields)
+                return Response(content=xml, media_type="application/xml")
+
+            # Funds are enough: create Pending, debit, mark Processed
+            try:
+                bet_tx = GameplayTransaction(
+                    userId=userId,
+                    wallet_id=w.wallet_id,
+                    bank_id=resolved_bank_id,
+                    transaction_type="bet",
+                    amount=Decimal(bet_cents) / Decimal(100),
+                    status="Pending",
+                    description=None,
+                    external_transaction_id=str(bet_ext),
+                    external_gamesession_id=str(gameSessionId or ""),
+                    external_gameround_id=str(roundId or ""),
+                    external_game_id=str(gameId or ""),
+                    ISROUNDFINISHED=str(isRoundFinished).lower() if isRoundFinished is not None else None,
+                )
+                db.add(bet_tx)
+                _apply_amount_to_wallet(w, bet_cents, op="debit")
+                bet_tx.status = "Processed"
+                db.flush()
+            except IntegrityError:
+                db.rollback()
+                again = (
+                    db.query(GameplayTransaction)
+                    .filter(
+                        GameplayTransaction.userId == userId,
+                        GameplayTransaction.bank_id == resolved_bank_id,
+                        GameplayTransaction.transaction_type == "bet",
+                        GameplayTransaction.external_transaction_id == str(bet_ext),
+                    )
+                    .first()
+                )
+                if again and again.status == "Failed":
+                    xml = envelope_fail(300, "INSUFFICIENT_FUNDS", request_fields=req_fields)
+                    return Response(content=xml, media_type="application/xml")
+            except Exception:
+                db.rollback()
+                xml = envelope_fail(500, "internal error applying bet", request_fields=req_fields)
+                return Response(content=xml, media_type="application/xml")
+
+    # ----- Handle WIN (credit) -----
+    # We process negativeBet as a separate credit transaction type "neg" that shares the WIN's ext id.
     if win_ext is not None and win_cents is not None:
-        try:
-            tx = GameplayTransaction(
-                userId=userId,
-                wallet_id=w.wallet_id,
-                bank_id=resolved_bank_id,
-                transaction_type="win",
-                amount=Decimal(win_cents) / Decimal(100),
-                status="Pending",
-                description=None,
-                external_transaction_id=str(win_ext),
-                external_gamesession_id=str(gameSessionId or ""),
-                external_gameround_id=str(roundId or ""),
-                external_game_id=str(gameId or ""),
-                ISROUNDFINISHED=str(isRoundFinished).lower() if isRoundFinished is not None else None,
+        # 1) negativeBet credit (if any)
+        if neg_cents > 0:
+            existing_neg = (
+                db.query(GameplayTransaction)
+                .filter(
+                    GameplayTransaction.userId == userId,
+                    GameplayTransaction.bank_id == resolved_bank_id,
+                    GameplayTransaction.transaction_type == "neg",
+                    GameplayTransaction.external_transaction_id == str(win_ext),
+                )
+                .first()
             )
-            db.add(tx)
-            if win_cents and win_cents > 0:
-                _apply_amount_to_wallet(w, win_cents, op="credit")
-            tx.status = "Processed"
-            db.flush()
-        except IntegrityError:
-            db.rollback()
-            # Already processed win => no double-credit
-        except Exception:
-            db.rollback()
-            xml = envelope_fail(500, "internal error applying win", request_fields=req_fields)
-            return Response(content=xml, media_type="application/xml")
+            if not existing_neg:
+                try:
+                    neg_tx = GameplayTransaction(
+                        userId=userId,
+                        wallet_id=w.wallet_id,
+                        bank_id=resolved_bank_id,
+                        transaction_type="neg",  # <= separate type within 10 chars
+                        amount=Decimal(neg_cents) / Decimal(100),
+                        status="Pending",
+                        description="Negative bet return",
+                        external_transaction_id=str(win_ext),  # tie to WIN's ext id
+                        external_gamesession_id=str(gameSessionId or ""),
+                        external_gameround_id=str(roundId or ""),
+                        external_game_id=str(gameId or ""),
+                        ISROUNDFINISHED=str(isRoundFinished).lower() if isRoundFinished is not None else None,
+                    )
+                    db.add(neg_tx)
+                    _apply_amount_to_wallet(w, neg_cents, op="credit")
+                    neg_tx.status = "Processed"
+                    db.flush()
+                except IntegrityError:
+                    db.rollback()
+                    # already processed neg — OK
+                except Exception:
+                    db.rollback()
+                    xml = envelope_fail(500, "internal error applying negativeBet", request_fields=req_fields)
+                    return Response(content=xml, media_type="application/xml")
 
-    # Commit
+        # 2) win credit
+        existing_win = (
+            db.query(GameplayTransaction)
+            .filter(
+                GameplayTransaction.userId == userId,
+                GameplayTransaction.bank_id == resolved_bank_id,
+                GameplayTransaction.transaction_type == "win",
+                GameplayTransaction.external_transaction_id == str(win_ext),
+            )
+            .first()
+        )
+        if not existing_win:
+            try:
+                win_tx = GameplayTransaction(
+                    userId=userId,
+                    wallet_id=w.wallet_id,
+                    bank_id=resolved_bank_id,
+                    transaction_type="win",
+                    amount=Decimal(win_cents) / Decimal(100),
+                    status="Pending",
+                    description=None,
+                    external_transaction_id=str(win_ext),
+                    external_gamesession_id=str(gameSessionId or ""),
+                    external_gameround_id=str(roundId or ""),
+                    external_game_id=str(gameId or ""),
+                    ISROUNDFINISHED=str(isRoundFinished).lower() if isRoundFinished is not None else None,
+                )
+                db.add(win_tx)
+                if win_cents and win_cents > 0:
+                    _apply_amount_to_wallet(w, win_cents, op="credit")
+                win_tx.status = "Processed"
+                db.flush()
+            except IntegrityError:
+                db.rollback()
+                # already processed — OK
+            except Exception:
+                db.rollback()
+                xml = envelope_fail(500, "internal error applying win", request_fields=req_fields)
+                return Response(content=xml, media_type="application/xml")
+
+    # Commit all changes
     try:
         db.commit()
     except Exception:
@@ -235,10 +375,8 @@ async def bet_result(
         xml = envelope_fail(500, "internal error committing", request_fields=req_fields)
         return Response(content=xml, media_type="application/xml")
 
-    # Balance in cents for response
-    balance_after_cents = wallet_cents(db, userId, currency)
-
-    # Choose external id to echo back: prefer WIN if present, else BET
+    # Response
+    balance_after_cents = int(Decimal(w.balance or 0) * 100)
     ext_id = win_ext or bet_ext or ""
 
     xml = envelope_bet_ok(

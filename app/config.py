@@ -39,11 +39,11 @@ class Settings(BaseSettings):
     DEFAULT_WALLET_CURRENCIES: str = "USD,VND"
     DEFAULT_WALLET_TYPE: str = "CASH"
 
-    # ---- Instagram auth mode ----
-    # valid values: "basic_display" (your current flow)
-    IG_AUTH_MODE: str = "basic_display"
+    # App-level Lobby token TTL (minutes) — moved out of BSG scope
+    LOBBY_TOKEN_EXP_MIN: int = 1440  # 24h default
 
-    # Instagram **Basic Display** credentials (you discovered these work with scope=instagram_business_basic)
+    # ---- Instagram auth mode ----
+    IG_AUTH_MODE: str = "basic_display"
     IGBD_APP_ID: str | None = Field(default=None, env="IGBD_APP_ID")
     IGBD_APP_SECRET: str | None = Field(default=None, env="IGBD_APP_SECRET")
     IGBD_REDIRECT_URI: str | None = Field(default=None, env="IGBD_REDIRECT_URI")

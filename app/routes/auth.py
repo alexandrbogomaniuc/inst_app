@@ -1,11 +1,11 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Header
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-
+from datetime import datetime
 from igw.app.db import get_db
-from igw.app.models import Player
-from igw.app.utils.security import hash_password, create_token
+from igw.app.models import Player, UserSession
+from igw.app.utils.security import hash_password, create_token,decode_token
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -48,3 +48,29 @@ def register(req: RegisterRequest, db: Session = Depends(get_db)):
     db.commit()
 
     return RegisterResponse(user_id=player.user_id, email=player.email, token=token)
+
+@router.post("/logout")
+def logout(authorization: str | None = Header(None), db: Session = Depends(get_db)):
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=400, detail="Missing bearer token")
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        payload = decode_token(token)
+        uid = payload.get("uid") or int(payload.get("sub"))
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    s = (
+        db.query(UserSession)
+        .filter(UserSession.userId == uid, UserSession.token == token, UserSession.status == "active")
+        .first()
+    )
+    if not s:
+        # idempotent: already closed or not found
+        return {"result": "ok"}
+
+    s.status = "logged_out"
+    s.logout_time = datetime.utcnow()
+    db.add(s)
+    db.commit()
+    return {"result": "ok"}

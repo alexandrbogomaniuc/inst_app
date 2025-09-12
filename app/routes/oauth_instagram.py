@@ -13,6 +13,7 @@ from igw.app.db import get_db
 from igw.app.models import Player, UserSession, Wallet  # <- add Wallet
 from igw.app.utils.account import ensure_wallets_for_user
 from igw.app.utils.security import create_token
+from igw.app.utils.sessions import exp_from_jwt            # <-- NEW: to fill expires_at
 from igw.app.providers.bsg.settings import bsg_settings, get_bank_settings  # <- new
 
 router = APIRouter(prefix="/oauth/instagram", tags=["oauth-instagram"])
@@ -40,7 +41,7 @@ async def instagram_login():
     params = {
         "client_id": settings.IGBD_APP_ID,
         "redirect_uri": settings.IGBD_REDIRECT_URI,
-        "scope": settings.IGBD_SCOPES,  # you observed instagram_business_basic works in your app setup
+        "scope": settings.IGBD_SCOPES,
         "response_type": "code",
     }
     url = f"{base}?{urlencode(params)}"
@@ -115,8 +116,12 @@ async def instagram_callback(
     wallets = db.query(Wallet).filter(Wallet.userId == player.userId).all()
     by_ccy = {w.currency_code.upper(): w for w in wallets}
 
-    # 4) Create lobby session (JWT)
-    lobby_token = create_token({"uid": player.userId, "type": "lobby"})
+    # 4) Create lobby session (JWT) — TTL is app-level now
+    lobby_token = create_token({
+        "uid": player.userId,
+        "type": "lobby",
+        "exp_m": settings.LOBBY_TOKEN_EXP_MIN,   # <-- use app-level TTL
+    })
     lobby_sess = UserSession(
         userId=player.userId,
         token=lobby_token,
@@ -124,11 +129,11 @@ async def instagram_callback(
         provider="instagram_basic_display",
         status="active",
         Login_IP=(request.client.host if request and request.client else None),
+        expires_at=exp_from_jwt(lobby_token),     # <-- fill DB expires_at
     )
     db.add(lobby_sess)
 
-    # 5) Create a BSG game token + session (this is the token BSG will send back to /betsoft/authenticate)
-    # Load bank settings (default bank if none specified)
+    # 5) Create a BSG game token + session (token BSG will send back to /betsoft/authenticate)
     base = bsg_settings()
     bank = get_bank_settings(base.BSG_DEFAULT_BANK_ID)
 
@@ -138,7 +143,7 @@ async def instagram_callback(
         "provider": "bsg",
         "bankId": bank.BSG_BANK_ID,
         "gameId": bank.BSG_DEFAULT_GAME_ID,
-        "exp_m": 60,  # 60 minutes validity by default
+        "exp_m": 60,  # keep your default game TTL, or use bank.BSG_TOKEN_GAME_EXP_MIN if you have it
     }
     bsg_token = create_token(game_claims)
     game_sess = UserSession(
@@ -149,6 +154,7 @@ async def instagram_callback(
         status="active",
         Login_IP=(request.client.host if request and request.client else None),
         meta={"bankId": bank.BSG_BANK_ID, "gameId": bank.BSG_DEFAULT_GAME_ID},
+        expires_at=exp_from_jwt(bsg_token),       # <-- fill DB expires_at
     )
     db.add(game_sess)
     db.commit()
@@ -170,7 +176,7 @@ async def instagram_callback(
     )
     start_url = f"{start_host}/cwstartgamev2.do?{cw_query}"
 
-    # 7) Simple confirmation page w/ balances (kept pretty)
+    # 7) Simple confirmation page w/ balances + logout button (POST /auth/logout with lobby token)
     usd_bal = f"{by_ccy.get('USD').balance:.2f}" if by_ccy.get("USD") else "0.00"
     vnd_bal = f"{by_ccy.get('VND').balance:.2f}" if by_ccy.get("VND") else "0.00"
 
@@ -178,21 +184,50 @@ async def instagram_callback(
     <style>
       body{{font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Arial;margin:40px;line-height:1.5}}
       pre{{background:#0b1020;color:#e6edf3;padding:16px;border-radius:8px;overflow:auto}}
-      .row span{{display:inline-block;min-width:140px;color:#9fb3c8}}
-      a.button{{display:inline-block;margin-top:12px;padding:10px 14px;border-radius:8px;border:1px solid #cbd5e1;text-decoration:none}}
+      .row span{{display:inline-block;min-width:160px;color:#64748b}}
+      a.button,button.button{{display:inline-block;margin-top:12px;padding:10px 14px;border-radius:8px;border:1px solid #cbd5e1;text-decoration:none;background:white;cursor:pointer}}
       h2{{margin-bottom:6px}}
+      code.small{{font-size:12px}}
     </style>
     <h2>Instagram login — success</h2>
+
     <div class="row"><span>User ID:</span> {player.userId}</div>
     <div class="row"><span>Username:</span> {player.user_name}</div>
     <div class="row"><span>Wallet USD:</span> {usd_bal}</div>
     <div class="row"><span>Wallet VND:</span> {vnd_bal}</div>
-    <div class="row"><span>Lobby token:</span></div>
+
+    <div class="row"><span>Lobby token (exp in {settings.LOBBY_TOKEN_EXP_MIN}m):</span></div>
     <pre>{lobby_token}</pre>
-    <div class="row"><span>BSG token:</span></div>
+
+    <div class="row"><span>BSG token (game):</span></div>
     <pre>{bsg_token}</pre>
+
     <div class="row"><span>Start Game URL:</span></div>
     <pre>{start_url}</pre>
+
     <a class="button" href="{start_url}" target="_blank" rel="noopener">Launch test game</a>
+    <button class="button" onclick="logout()">Logout</button>
+
+    <script>
+      async function logout() {{
+        try {{
+          const resp = await fetch('/auth/logout', {{
+            method: 'POST',
+            headers: {{
+              'Authorization': 'Bearer {lobby_token}',
+            }},
+          }});
+          if (resp.ok) {{
+            alert('Logged out.');
+            window.location.href = '/';
+          }} else {{
+            const t = await resp.text();
+            alert('Logout failed: ' + t);
+          }}
+        }} catch (e) {{
+          alert('Logout error: ' + e);
+        }}
+      }}
+    </script>
     """
     return HTMLResponse(html)
